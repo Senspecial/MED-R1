@@ -2,21 +2,22 @@
 Stage 1: Supervised Fine-Tuning (SFT) on medical reasoning data.
 
 Usage (8-GPU setup):
-    accelerate launch --config_file ./configs/deepspeed_zero3.yaml \
-        --num_processes 8 \
-        --num_machines 1 \
-        --machine_rank 0 \
-        --deepspeed_multinode_launcher standard \
-        SFT_stage1.py \
-        --model_path meta-llama/Llama-3.1-8B-Instruct \
-        --data_path data/medical_o1_sft_mix_Chinese.json \
-        --output_dir ./ckpts \
-        --experiment_name sft_stage1 \
-        --n_epochs 3 \
-        --learning_rate 5e-6 \
-        --train_bsz_per_gpu 2 \
-        --gradient_accumulation_steps 8 \
-        --max_seq_len 8192
+    nohup bash -c 'accelerate launch --config_file configs/deepspeed_zero2.yaml \
+    --num_processes 8 \
+    --num_machines 1 \
+    --machine_rank 0 \
+    --deepspeed_multinode_launcher standard \
+    SFT_stage1.py \
+    --model_path /tmp/Qwen3-8B \
+    --data_path data/medical_o1_sft_mix_Chinese.json \
+    --output_dir ./ckpts \
+    --experiment_name sft_stage1 \
+    --n_epochs 2 \
+    --learning_rate 5e-6 \
+    --train_bsz_per_gpu 2 \
+    --gradient_accumulation_steps 8 \
+    --max_seq_len 8192 \
+    --save_steps 1000' > train.log 2>&1 &
 """
 
 import os
@@ -28,7 +29,11 @@ import argparse
 from tqdm import tqdm
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
-import wandb
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
 from accelerate import Accelerator
 from transformers import set_seed, get_cosine_schedule_with_warmup
 import shutil
@@ -153,7 +158,8 @@ def train(args):
     accelerator = Accelerator(mixed_precision='bf16', gradient_accumulation_steps=args.gradient_accumulation_steps) 
 
     if accelerator.is_main_process:
-        wandb.init(project = args.experiment_name, config=args, dir=args.log_dir, mode="offline")
+        if HAS_WANDB:
+            wandb.init(project = args.experiment_name, config=args, dir=args.log_dir, mode="offline")
     
     accelerator.print(f'args:\n{args}')
 
@@ -264,13 +270,17 @@ def train(args):
             if accelerator.is_main_process:
                 train_dataloader_iterator.set_postfix(epoch=epoch, current_step=batch_cnt, total_step=len(train_dataloader), skip=accelerator.optimizer_step_was_skipped, loss=round(train_loss, 3), acc=round(acc, 3), length=len(input_ids[0]), lr=lr_scheduler.get_last_lr()[0])
 
-            if global_step % 3 == 0 and accelerator.is_main_process:
+            if global_step % 3 == 0 and accelerator.is_main_process and HAS_WANDB:
                 wandb.log({
-                    'skip': int(accelerator.optimizer_step_was_skipped),
-                    'loss': train_loss,
-                    'acc': acc,
-                    'lr': lr_scheduler.get_last_lr()[0]
-                }, step=global_step)
+                        'skip': int(accelerator.optimizer_step_was_skipped),
+                        'loss': train_loss,
+                        'acc': acc,
+                        'lr': lr_scheduler.get_last_lr()[0]
+                    }, step=global_step)
+
+            if args.save_steps > 0 and global_step % args.save_steps == 0:
+                accelerator.wait_for_everyone()
+                save_checkpoint(epoch, batch_cnt, global_step)
 
         accelerator.wait_for_everyone()
         save_checkpoint(epoch, batch_cnt, global_step)
@@ -294,6 +304,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_seq_len', default=8192, type=int)
     parser.add_argument('--gradient_checkpointing', action='store_true')
     parser.add_argument('--gradient_accumulation_steps', default=8, type=int)
+    parser.add_argument('--save_steps', default=500, type=int, help="Save checkpoint every N steps (0=only at epoch end)")
     parser.add_argument('--train_bsz_per_gpu', default=2, type=int)
     parser.add_argument('--weight_decay', default=0.1, type=float)
     parser.add_argument('--learning_rate', default=5e-6, type=float)
