@@ -42,6 +42,12 @@ from torch.utils.data import Dataset, DataLoader
 from accelerate import Accelerator
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed, get_cosine_schedule_with_warmup
 
+try:
+    from peft import LoraConfig, get_peft_model, TaskType
+    PEFT_AVAILABLE = True
+except ImportError:
+    PEFT_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level="INFO")
 
@@ -54,7 +60,7 @@ class ProcessRewardModel(nn.Module):
         super().__init__()
         self.backbone = backbone
         hidden_size = backbone.config.hidden_size
-        self.reward_head = nn.Linear(hidden_size, 1)
+        self.reward_head = nn.Linear(hidden_size, 1, dtype=backbone.dtype)
         nn.init.zeros_(self.reward_head.bias)
 
     def forward(self, input_ids, attention_mask, score_positions):
@@ -142,13 +148,16 @@ def main():
     parser.add_argument("--output_dir", type=str, default="ckpts/prm_qwen3_4b")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--max_seq_len", type=int, default=4096)
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--eval_ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--save_steps", type=int, default=2000)
+    parser.add_argument("--use_lora", action="store_true", help="Use LoRA for efficient fine-tuning")
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -176,9 +185,26 @@ def main():
 
     backbone = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         torch_dtype=torch.bfloat16,
     )
+    backbone.gradient_checkpointing_enable()
+
+    if args.use_lora:
+        assert PEFT_AVAILABLE, "pip install peft  is required for --use_lora"
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            lora_dropout=0.05,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+        )
+        backbone = get_peft_model(backbone, lora_config)
+        trainable, total = backbone.get_nb_trainable_parameters()
+        accelerator.print(f"LoRA enabled: trainable {trainable:,} / {total:,} params "
+                          f"({100*trainable/total:.2f}%)")
+
     model = ProcessRewardModel(backbone)
 
     with open(args.data_path) as f:
@@ -196,13 +222,17 @@ def main():
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
         collate_fn=train_dataset.collate_fn, drop_last=True,
+        num_workers=4, pin_memory=True,
     )
     eval_loader = DataLoader(
         eval_dataset, batch_size=args.batch_size, shuffle=False,
         collate_fn=eval_dataset.collate_fn,
+        num_workers=4, pin_memory=True,
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    accelerator.print(f"Optimizer trainable params: {sum(p.numel() for p in trainable_params):,}")
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.01)
     num_training_steps = len(train_loader) * args.epochs // args.gradient_accumulation_steps
     warmup_steps = int(num_training_steps * args.warmup_ratio)
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, num_training_steps)
@@ -211,7 +241,7 @@ def main():
         model, optimizer, train_loader, eval_loader, scheduler
     )
 
-    loss_fn = nn.MSELoss()
+    loss_fn = nn.BCELoss()
     global_step = 0
 
     for epoch in range(args.epochs):
@@ -222,7 +252,7 @@ def main():
                 preds = model(
                     batch["input_ids"], batch["attention_mask"], batch["score_positions"]
                 )
-                loss = loss_fn(preds, batch["labels"])
+                loss = loss_fn(preds, batch["labels"].to(preds.dtype))
                 accelerator.backward(loss)
                 optimizer.step()
                 scheduler.step()
@@ -258,7 +288,7 @@ def main():
                 preds = model(
                     batch["input_ids"], batch["attention_mask"], batch["score_positions"]
                 )
-                loss = loss_fn(preds, batch["labels"])
+                loss = loss_fn(preds, batch["labels"].to(preds.dtype))
                 eval_loss += loss.item()
                 pred_binary = (preds > 0.5).float()
                 label_binary = (batch["labels"] > 0.5).float()
