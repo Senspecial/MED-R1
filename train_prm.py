@@ -18,9 +18,9 @@ Input format (from construct_prm_data.py --output_path):
 Usage:
     accelerate launch --config_file configs/deepspeed_zero2.yaml \
         --num_processes 8 train_prm.py \
-        --model_path meta-llama/Llama-3.2-3B-Instruct \
+        --model_path /tmp/Qwen3-4B \
         --data_path data/prm_train_data.json \
-        --output_dir ckpts/prm_3b \
+        --output_dir ckpts/prm_qwen3_4b \
         --epochs 3 \
         --lr 2e-5 \
         --batch_size 4 \

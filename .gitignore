@@ -19,6 +19,9 @@ wandb/
 *.pt
 *.pth
 
+# Run scripts (contains keys, env info)
+run/
+
 # IDE
 .vscode/
 .idea/
