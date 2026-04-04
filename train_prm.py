@@ -16,16 +16,15 @@ Input format (from construct_prm_data.py --output_path):
 ]
 
 Usage:
-    accelerate launch --config_file configs/deepspeed_zero2.yaml \
+    nohup accelerate launch --config_file configs/deepspeed_zero2.yaml \
         --num_processes 8 train_prm.py \
         --model_path /tmp/Qwen3-4B \
         --data_path data/prm_train_data.json \
         --output_dir ckpts/prm_qwen3_4b \
+        --use_lora \
         --epochs 3 \
         --lr 2e-5 \
-        --batch_size 4 \
-        --gradient_accumulation_steps 8 \
-        --max_seq_len 4096
+        > prm_train.log 2>&1 &
 """
 
 import os
@@ -41,6 +40,7 @@ import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
 from accelerate import Accelerator
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed, get_cosine_schedule_with_warmup
+from tqdm import tqdm
 
 try:
     from peft import LoraConfig, get_peft_model, TaskType
@@ -70,7 +70,7 @@ class ProcessRewardModel(nn.Module):
             attention_mask: (B, L)
             score_positions: (B,) index of the token where we extract the reward
         Returns:
-            scores: (B,) predicted step scores in [0, 1]
+            logits: (B,) raw logits (apply sigmoid for probabilities)
         """
         outputs = self.backbone(
             input_ids=input_ids,
@@ -80,8 +80,8 @@ class ProcessRewardModel(nn.Module):
         hidden = outputs.hidden_states[-1]  # (B, L, H)
         batch_idx = torch.arange(hidden.size(0), device=hidden.device)
         step_hidden = hidden[batch_idx, score_positions]  # (B, H)
-        scores = self.reward_head(step_hidden).squeeze(-1)  # (B,)
-        return torch.sigmoid(scores)
+        logits = self.reward_head(step_hidden).squeeze(-1)  # (B,)
+        return logits
 
 
 # ---------------------------------------------------------------------------
@@ -209,12 +209,29 @@ def main():
 
     with open(args.data_path) as f:
         all_data = json.load(f)
-    random.shuffle(all_data)
 
-    eval_size = max(int(len(all_data) * args.eval_ratio), 100)
-    eval_data = all_data[:eval_size]
-    train_data = all_data[eval_size:]
-    accelerator.print(f"Train: {len(train_data)}, Eval: {len(eval_data)}")
+    questions_to_samples = {}
+    for item in all_data:
+        q = item["question"]
+        questions_to_samples.setdefault(q, []).append(item)
+    unique_questions = list(questions_to_samples.keys())
+    random.shuffle(unique_questions)
+
+    eval_q_count = max(int(len(unique_questions) * args.eval_ratio), 10)
+    eval_questions = set(unique_questions[:eval_q_count])
+    eval_data = [s for q in eval_questions for s in questions_to_samples[q]]
+    train_data = [s for q in unique_questions[eval_q_count:] for s in questions_to_samples[q]]
+    random.shuffle(train_data)
+    random.shuffle(eval_data)
+    accelerator.print(f"Questions: {len(unique_questions)} total, {eval_q_count} eval, "
+                      f"{len(unique_questions)-eval_q_count} train")
+    accelerator.print(f"Samples: Train {len(train_data)}, Eval {len(eval_data)}")
+    pos_train = sum(1 for d in train_data if d["score"] > 0.5)
+    pos_eval = sum(1 for d in eval_data if d["score"] > 0.5)
+    accelerator.print(f"Train positive ratio: {pos_train}/{len(train_data)} "
+                      f"({100*pos_train/len(train_data):.1f}%)")
+    accelerator.print(f"Eval  positive ratio: {pos_eval}/{len(eval_data)} "
+                      f"({100*pos_eval/len(eval_data):.1f}%)")
 
     train_dataset = PRMDataset(train_data, tokenizer, args.max_seq_len)
     eval_dataset = PRMDataset(eval_data, tokenizer, args.max_seq_len)
@@ -241,13 +258,15 @@ def main():
         model, optimizer, train_loader, eval_loader, scheduler
     )
 
-    loss_fn = nn.BCELoss()
+    loss_fn = nn.BCEWithLogitsLoss()
     global_step = 0
 
     for epoch in range(args.epochs):
         model.train()
         total_loss = 0.0
-        for step, batch in enumerate(train_loader):
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}",
+                    disable=not accelerator.is_main_process)
+        for step, batch in enumerate(pbar):
             with accelerator.accumulate(model):
                 preds = model(
                     batch["input_ids"], batch["attention_mask"], batch["score_positions"]
@@ -261,12 +280,10 @@ def main():
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 global_step += 1
-                if global_step % 50 == 0:
-                    avg_loss = total_loss / (step + 1)
-                    accelerator.print(
-                        f"Epoch {epoch+1} Step {global_step} Loss: {avg_loss:.4f} "
-                        f"LR: {scheduler.get_last_lr()[0]:.2e}"
-                    )
+                avg_loss = total_loss / (step + 1)
+                pbar.set_postfix(loss=f"{avg_loss:.4f}",
+                                 lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                                 step=global_step)
                 if global_step % args.save_steps == 0:
                     save_path = os.path.join(args.output_dir, f"step_{global_step}")
                     accelerator.wait_for_everyone()
@@ -283,22 +300,37 @@ def main():
         eval_loss = 0.0
         eval_correct = 0
         eval_total = 0
+        all_probs = []
+        all_labels = []
         with torch.no_grad():
             for batch in eval_loader:
-                preds = model(
+                logits = model(
                     batch["input_ids"], batch["attention_mask"], batch["score_positions"]
                 )
-                loss = loss_fn(preds, batch["labels"].to(preds.dtype))
+                loss = loss_fn(logits, batch["labels"].to(logits.dtype))
                 eval_loss += loss.item()
-                pred_binary = (preds > 0.5).float()
+                probs = torch.sigmoid(logits)
+                pred_binary = (probs > 0.5).float()
                 label_binary = (batch["labels"] > 0.5).float()
                 eval_correct += (pred_binary == label_binary).sum().item()
-                eval_total += len(preds)
+                eval_total += len(logits)
+                all_probs.extend(probs.float().cpu().tolist())
+                all_labels.extend(batch["labels"].cpu().tolist())
 
         avg_eval_loss = eval_loss / max(len(eval_loader), 1)
         accuracy = eval_correct / max(eval_total, 1)
+        auc_str = ""
+        try:
+            from sklearn.metrics import roc_auc_score
+            binary_labels = [1 if l > 0.5 else 0 for l in all_labels]
+            if len(set(binary_labels)) > 1:
+                auc = roc_auc_score(binary_labels, all_probs)
+                auc_str = f" AUC: {auc:.4f}"
+        except ImportError:
+            pass
         accelerator.print(
-            f"Epoch {epoch+1} Eval Loss: {avg_eval_loss:.4f} Accuracy: {accuracy:.4f}"
+            f"Epoch {epoch+1} Eval Loss: {avg_eval_loss:.4f} "
+            f"Accuracy: {accuracy:.4f}{auc_str}"
         )
 
     # Final save
