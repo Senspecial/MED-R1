@@ -27,14 +27,14 @@ Usage:
         --save_dir output_data/prm_construction \\
         --judge_model deepseek-chat \\
         --judge_api_url https://api.deepseek.com/v1/chat/completions \\
-        --judge_api_key sk-f6c4a1c41a9d4c13adec3aad23f147f8 \\
+        --judge_api_key  \\
         --output_path data/prm_train_data.json
 
     # === All-API mode (no GPU needed) ===
     python3 construct_prm_data.py \\
         --model_name deepseek-chat \\
         --api_url https://api.deepseek.com/v1/chat/completions \\
-        --api_key sk-f6c4a1c41a9d4c13adec3aad23f147f8 \\
+        --api_key  \\
         --data_path data/medical_o1_verifiable_problem.json \\
         --num_chains 10 --num_workers 8 \\
         --output_path data/prm_train_data.json
