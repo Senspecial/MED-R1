@@ -2,7 +2,7 @@
 Train a Process Reward Model (PRM).
 
 The PRM predicts a scalar quality score for each reasoning step. We place
-a reward head on top of a causal LM backbone (e.g. Llama-3.2-3B) and train
+a reward head on top of a causal LM backbone (e.g. Qwen3-4B) and train
 it to predict the Monte-Carlo step scores produced by construct_prm_data.py.
 
 Input format (from construct_prm_data.py --output_path):
@@ -139,7 +139,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--data_path", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, default="ckpts/prm_3b")
+    parser.add_argument("--output_dir", type=str, default="ckpts/prm_qwen3_4b")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -158,9 +158,21 @@ def main():
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    if tokenizer.pad_token_id is None or tokenizer.pad_token_id == tokenizer.eos_token_id:
+        # Find a pad token that differs from eos (needed for Qwen3, Llama, etc.)
+        for candidate in ["<|endoftext|>", "<|end_of_text|>"]:
+            vocab = tokenizer.get_vocab()
+            if candidate in vocab:
+                cid = tokenizer.convert_tokens_to_ids(candidate)
+                if cid != tokenizer.eos_token_id:
+                    tokenizer.pad_token = candidate
+                    tokenizer.pad_token_id = cid
+                    break
+        else:
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+    accelerator.print(f"pad_token={tokenizer.pad_token!r} (id={tokenizer.pad_token_id}), "
+                      f"eos_token={tokenizer.eos_token!r} (id={tokenizer.eos_token_id})")
 
     backbone = AutoModelForCausalLM.from_pretrained(
         args.model_path,
