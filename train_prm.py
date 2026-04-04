@@ -22,7 +22,7 @@ Usage:
         --data_path data/prm_train_data.json \
         --output_dir ckpts/prm_qwen3_4b \
         --use_lora \
-        --epochs 3 \
+        --epochs 2 \
         --lr 2e-5 \
         > prm_train.log 2>&1 &
 """
@@ -37,7 +37,7 @@ import logging
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from accelerate import Accelerator
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed, get_cosine_schedule_with_warmup
 from tqdm import tqdm
@@ -72,12 +72,13 @@ class ProcessRewardModel(nn.Module):
         Returns:
             logits: (B,) raw logits (apply sigmoid for probabilities)
         """
-        outputs = self.backbone(
+        base_model = self.backbone.model if not hasattr(self.backbone, 'base_model') \
+            else self.backbone.base_model.model.model
+        outputs = base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True,
         )
-        hidden = outputs.hidden_states[-1]  # (B, L, H)
+        hidden = outputs.last_hidden_state  # (B, L, H)
         batch_idx = torch.arange(hidden.size(0), device=hidden.device)
         step_hidden = hidden[batch_idx, score_positions]  # (B, H)
         logits = self.reward_head(step_hidden).squeeze(-1)  # (B,)
@@ -100,6 +101,14 @@ class PRMDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.data[idx]
+
+    def get_lengths(self):
+        """Estimate token lengths for all samples (char-based approximation)."""
+        lengths = []
+        for item in self.data:
+            text = f"Question: {item['question']}\n\nReasoning:\n\n{STEP_SEP.join(item['prefix_steps'])}"
+            lengths.append(len(text) // 3)  # rough char-to-token ratio
+        return lengths
 
     def collate_fn(self, batch):
         input_ids_list = []
@@ -138,6 +147,25 @@ class PRMDataset(Dataset):
         }
 
 
+class LengthGroupedSampler(Sampler):
+    """Yields indices so that similar-length samples end up in the same batch."""
+    def __init__(self, lengths, batch_size, shuffle=True):
+        self.shuffle = shuffle
+        sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
+        self.chunks = [sorted_indices[i:i+batch_size]
+                       for i in range(0, len(sorted_indices), batch_size)]
+
+    def __iter__(self):
+        chunks = self.chunks[:]
+        if self.shuffle:
+            random.shuffle(chunks)
+        for chunk in chunks:
+            yield from chunk
+
+    def __len__(self):
+        return sum(len(c) for c in self.chunks)
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
@@ -146,11 +174,11 @@ def main():
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="ckpts/prm_qwen3_4b")
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--max_seq_len", type=int, default=4096)
+    parser.add_argument("--max_seq_len", type=int, default=2048)
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--eval_ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
@@ -185,17 +213,15 @@ def main():
 
     backbone = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        attn_implementation="sdpa",
+        attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
     )
-    backbone.gradient_checkpointing_enable()
-
     if args.use_lora:
         assert PEFT_AVAILABLE, "pip install peft  is required for --use_lora"
         lora_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             lora_dropout=0.05,
             bias="none",
             task_type=TaskType.CAUSAL_LM,
@@ -236,8 +262,21 @@ def main():
     train_dataset = PRMDataset(train_data, tokenizer, args.max_seq_len)
     eval_dataset = PRMDataset(eval_data, tokenizer, args.max_seq_len)
 
+    train_lengths = train_dataset.get_lengths()
+    train_lengths_sorted = sorted(train_lengths)
+    n = len(train_lengths_sorted)
+    accelerator.print(f"Token length stats (approx): "
+                      f"min={train_lengths_sorted[0]}, "
+                      f"P25={train_lengths_sorted[n//4]}, "
+                      f"P50={train_lengths_sorted[n//2]}, "
+                      f"P75={train_lengths_sorted[3*n//4]}, "
+                      f"P95={train_lengths_sorted[int(n*0.95)]}, "
+                      f"max={train_lengths_sorted[-1]}")
+
+    train_sampler = LengthGroupedSampler(
+        train_lengths, batch_size=args.batch_size, shuffle=True)
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
+        train_dataset, batch_size=args.batch_size, sampler=train_sampler,
         collate_fn=train_dataset.collate_fn, drop_last=True,
         num_workers=4, pin_memory=True,
     )
