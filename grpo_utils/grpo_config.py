@@ -79,6 +79,9 @@ class GRPOConfig:
     eval_ratio: float = 0.05
     eval_max_num: int = 200
 
+    # Resume
+    resume_from_checkpoint: str = ""
+
     # System
     seed: int = 42
     num_workers: int = 4

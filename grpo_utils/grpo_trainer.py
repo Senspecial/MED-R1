@@ -401,7 +401,6 @@ class GRPOTrainer(Trainer):
         self.accelerator.wait_for_everyone()
         unwrapped = self.accelerator.unwrap_model(self.model)
 
-        # peft model (QLoRA) — save only adapter weights
         if hasattr(unwrapped, "save_pretrained") and hasattr(unwrapped, "peft_config"):
             if self.accelerator.is_main_process:
                 unwrapped.save_pretrained(output_dir)
@@ -411,6 +410,15 @@ class GRPOTrainer(Trainer):
             self.model = self.policy
             Trainer.save_model(self, output_dir, _internal_call)
             self.model = backup
+
+        if self.accelerator.is_main_process:
+            import json
+            state = {
+                "global_step": self.state.global_step,
+                "episode": self.state.episode,
+            }
+            with open(os.path.join(output_dir, "trainer_state.json"), "w") as f:
+                json.dump(state, f)
 
     def _save(self, output_dir=None, state_dict=None):
         if self.is_deepspeed_enabled and state_dict is not None:
@@ -489,6 +497,19 @@ class GRPOTrainer(Trainer):
         self.state.max_steps = args.num_total_batches
         self.state.num_train_epochs = args.total_episodes / self.train_dataset_len
 
+        resume_step = 0
+        if getattr(args, "resume_from_checkpoint", ""):
+            import json
+            ckpt_dir = args.resume_from_checkpoint
+            state_file = os.path.join(ckpt_dir, "trainer_state.json")
+            if os.path.exists(state_file):
+                with open(state_file) as f:
+                    saved = json.load(f)
+                resume_step = saved["global_step"]
+                self.state.global_step = resume_step
+                self.state.episode = saved["episode"]
+                accelerator.print(f"  Resuming from step {resume_step}, episode {self.state.episode}")
+
         if args.logging_steps and args.logging_steps >= 1:
             self.state.logging_steps = args.logging_steps
         if args.eval_steps and args.eval_steps >= 1:
@@ -500,10 +521,14 @@ class GRPOTrainer(Trainer):
         accumulate_answer_acc = []
         skipped_groups = 0
 
-        pbar = tqdm(range(1, args.num_total_batches + 1), desc="DAPO", disable=not accelerator.is_main_process)
+        pbar = tqdm(range(1, args.num_total_batches + 1), desc="DAPO", disable=not accelerator.is_main_process,
+                    initial=resume_step, total=args.num_total_batches)
         for update in pbar:
             self.state.episode += args.batch_size
             data = next(iter_dataloader)
+
+            if update <= resume_step:
+                continue
 
             with torch.no_grad():
                 queries = data["input_ids"].to(device)
