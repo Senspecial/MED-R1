@@ -38,6 +38,7 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.tensorboard import SummaryWriter
 from accelerate import Accelerator
 from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed, get_cosine_schedule_with_warmup
 from tqdm import tqdm
@@ -147,24 +148,6 @@ class PRMDataset(Dataset):
         }
 
 
-class LengthGroupedSampler(Sampler):
-    """Yields indices so that similar-length samples end up in the same batch."""
-    def __init__(self, lengths, batch_size, shuffle=True):
-        self.shuffle = shuffle
-        sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
-        self.chunks = [sorted_indices[i:i+batch_size]
-                       for i in range(0, len(sorted_indices), batch_size)]
-
-    def __iter__(self):
-        chunks = self.chunks[:]
-        if self.shuffle:
-            random.shuffle(chunks)
-        for chunk in chunks:
-            yield from chunk
-
-    def __len__(self):
-        return sum(len(c) for c in self.chunks)
-
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -178,20 +161,27 @@ def main():
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--max_seq_len", type=int, default=2048)
+    parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--eval_ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--save_steps", type=int, default=2000)
+    parser.add_argument("--save_steps", type=int, default=2300)
     parser.add_argument("--use_lora", action="store_true", help="Use LoRA for efficient fine-tuning")
     parser.add_argument("--lora_r", type=int, default=16)
     parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--logging_dir", type=str, default=None,
+                        help="TensorBoard log dir (default: <output_dir>/tb_logs)")
     args = parser.parse_args()
+
+    if args.logging_dir is None:
+        args.logging_dir = os.path.join(args.output_dir, "tb_logs")
 
     set_seed(args.seed)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision="bf16",
+        log_with="tensorboard",
+        project_dir=args.logging_dir,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
@@ -262,21 +252,8 @@ def main():
     train_dataset = PRMDataset(train_data, tokenizer, args.max_seq_len)
     eval_dataset = PRMDataset(eval_data, tokenizer, args.max_seq_len)
 
-    train_lengths = train_dataset.get_lengths()
-    train_lengths_sorted = sorted(train_lengths)
-    n = len(train_lengths_sorted)
-    accelerator.print(f"Token length stats (approx): "
-                      f"min={train_lengths_sorted[0]}, "
-                      f"P25={train_lengths_sorted[n//4]}, "
-                      f"P50={train_lengths_sorted[n//2]}, "
-                      f"P75={train_lengths_sorted[3*n//4]}, "
-                      f"P95={train_lengths_sorted[int(n*0.95)]}, "
-                      f"max={train_lengths_sorted[-1]}")
-
-    train_sampler = LengthGroupedSampler(
-        train_lengths, batch_size=args.batch_size, shuffle=True)
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, sampler=train_sampler,
+        train_dataset, batch_size=args.batch_size, shuffle=True,
         collate_fn=train_dataset.collate_fn, drop_last=True,
         num_workers=4, pin_memory=True,
     )
@@ -296,6 +273,8 @@ def main():
     model, optimizer, train_loader, eval_loader, scheduler = accelerator.prepare(
         model, optimizer, train_loader, eval_loader, scheduler
     )
+
+    accelerator.init_trackers("prm_training", config=vars(args))
 
     loss_fn = nn.BCEWithLogitsLoss()
     global_step = 0
@@ -320,9 +299,15 @@ def main():
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 global_step += 1
                 avg_loss = total_loss / (step + 1)
+                cur_lr = scheduler.get_last_lr()[0]
                 pbar.set_postfix(loss=f"{avg_loss:.4f}",
-                                 lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                                 lr=f"{cur_lr:.2e}",
                                  step=global_step)
+                accelerator.log({
+                    "train/loss": loss.item(),
+                    "train/loss_avg": avg_loss,
+                    "train/lr": cur_lr,
+                }, step=global_step)
                 if global_step % args.save_steps == 0:
                     save_path = os.path.join(args.output_dir, f"step_{global_step}")
                     accelerator.wait_for_everyone()
@@ -359,19 +344,26 @@ def main():
         avg_eval_loss = eval_loss / max(len(eval_loader), 1)
         accuracy = eval_correct / max(eval_total, 1)
         auc_str = ""
+        auc_val = 0.0
         try:
             from sklearn.metrics import roc_auc_score
             binary_labels = [1 if l > 0.5 else 0 for l in all_labels]
             if len(set(binary_labels)) > 1:
-                auc = roc_auc_score(binary_labels, all_probs)
-                auc_str = f" AUC: {auc:.4f}"
+                auc_val = roc_auc_score(binary_labels, all_probs)
+                auc_str = f" AUC: {auc_val:.4f}"
         except ImportError:
             pass
         accelerator.print(
             f"Epoch {epoch+1} Eval Loss: {avg_eval_loss:.4f} "
             f"Accuracy: {accuracy:.4f}{auc_str}"
         )
+        accelerator.log({
+            "eval/loss": avg_eval_loss,
+            "eval/accuracy": accuracy,
+            "eval/auc": auc_val,
+        }, step=global_step)
 
+    accelerator.end_training()
     # Final save
     accelerator.wait_for_everyone()
     unwrapped = accelerator.unwrap_model(model)
@@ -385,5 +377,49 @@ def main():
         accelerator.print(f"Model saved to {final_path}")
 
 
+def merge_lora():
+    """Merge LoRA adapter weights into base model and save full PRM checkpoint."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base_model_path", type=str, required=True,
+                        help="Path to the original base model (e.g. /tmp/Qwen3-4B)")
+    parser.add_argument("--lora_checkpoint", type=str, required=True,
+                        help="Path to LoRA checkpoint (e.g. ckpts/prm_qwen3_4b/step_2300)")
+    parser.add_argument("--output_path", type=str, required=True,
+                        help="Path to save merged full model")
+    args = parser.parse_args()
+
+    print(f"Loading base model from {args.base_model_path}")
+    from peft import PeftModel
+    backbone = AutoModelForCausalLM.from_pretrained(
+        args.base_model_path, torch_dtype=torch.bfloat16,
+    )
+
+    print(f"Loading LoRA adapter from {args.lora_checkpoint}")
+    backbone = PeftModel.from_pretrained(backbone, args.lora_checkpoint)
+
+    print("Merging LoRA weights into base model...")
+    backbone = backbone.merge_and_unload()
+
+    os.makedirs(args.output_path, exist_ok=True)
+    print(f"Saving merged model to {args.output_path}")
+    backbone.save_pretrained(args.output_path)
+
+    tokenizer = AutoTokenizer.from_pretrained(args.lora_checkpoint)
+    tokenizer.save_pretrained(args.output_path)
+
+    head_src = os.path.join(args.lora_checkpoint, "reward_head.pt")
+    if os.path.exists(head_src):
+        import shutil
+        shutil.copy2(head_src, os.path.join(args.output_path, "reward_head.pt"))
+        print("Copied reward_head.pt")
+
+    print("Done! Merged PRM saved to", args.output_path)
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--merge_lora" in sys.argv:
+        sys.argv.remove("--merge_lora")
+        merge_lora()
+    else:
+        main()
