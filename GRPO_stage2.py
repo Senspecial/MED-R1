@@ -239,18 +239,23 @@ if __name__ == "__main__":
         )
 
         if config.lora_r > 0:
-            target_modules = config.lora_target_modules
-            if "," in target_modules:
-                target_modules = [m.strip() for m in target_modules.split(",")]
-            lora_config = LoraConfig(
-                r=config.lora_r,
-                lora_alpha=config.lora_alpha,
-                lora_dropout=config.lora_dropout,
-                target_modules=target_modules,
-                bias="none",
-                task_type="CAUSAL_LM",
-            )
-            policy = get_peft_model(policy, lora_config)
+            if config.resume_from_checkpoint and os.path.exists(os.path.join(config.resume_from_checkpoint, "adapter_config.json")):
+                from peft import PeftModel
+                policy = PeftModel.from_pretrained(policy, config.resume_from_checkpoint, is_trainable=True)
+                print(f"Resumed LoRA from {config.resume_from_checkpoint}")
+            else:
+                target_modules = config.lora_target_modules
+                if "," in target_modules:
+                    target_modules = [m.strip() for m in target_modules.split(",")]
+                lora_config = LoraConfig(
+                    r=config.lora_r,
+                    lora_alpha=config.lora_alpha,
+                    lora_dropout=config.lora_dropout,
+                    target_modules=target_modules,
+                    bias="none",
+                    task_type="CAUSAL_LM",
+                )
+                policy = get_peft_model(policy, lora_config)
             policy.print_trainable_parameters()
 
         # DAPO has no KL penalty, ref_policy not needed
