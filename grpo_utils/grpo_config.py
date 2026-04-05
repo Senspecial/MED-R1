@@ -52,11 +52,11 @@ class GRPOConfig:
     lora_target_modules: str = "all-linear"
 
     # Training
-    learning_rate: float = 5e-6
+    learning_rate: float = 2e-5
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     total_episodes: int = 40000
-    per_device_batch_size: int = 1
+    per_device_batch_size: int = 2
     gradient_accumulation_steps: int = 16
     warmup_ratio: float = 0.05
     bf16: bool = True

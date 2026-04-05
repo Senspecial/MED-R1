@@ -309,6 +309,11 @@ class GRPOTrainer(Trainer):
         if args.should_save:
             os.makedirs(self.args.output_dir, exist_ok=True)
 
+        self.tb_writer = None
+        if accelerator.is_main_process:
+            from torch.utils.tensorboard import SummaryWriter
+            self.tb_writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "tb_logs"))
+
         self.hub_model_id = None
 
         # Dataloader
@@ -367,8 +372,13 @@ class GRPOTrainer(Trainer):
     def log(self, logs, start_time=None):
         if self.accelerator.is_main_process:
             step = self.state.global_step
-            msg = f"[Step {step}] " + "  ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}" for k, v in logs.items())
+            msg = f"[Step {step}] " + "  ".join(f"{k}={v:.6f}" if isinstance(v, float) else f"{k}={v}" for k, v in logs.items())
             self.accelerator.print(msg)
+            if self.tb_writer is not None:
+                for k, v in logs.items():
+                    if isinstance(v, (int, float)):
+                        self.tb_writer.add_scalar(k, v, step)
+                self.tb_writer.flush()
             if self.tb_writer is not None:
                 for k, v in logs.items():
                     if isinstance(v, (int, float)):
