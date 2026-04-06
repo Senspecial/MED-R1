@@ -379,11 +379,6 @@ class GRPOTrainer(Trainer):
                     if isinstance(v, (int, float)):
                         self.tb_writer.add_scalar(k, v, step)
                 self.tb_writer.flush()
-            if self.tb_writer is not None:
-                for k, v in logs.items():
-                    if isinstance(v, (int, float)):
-                        self.tb_writer.add_scalar(k, v, step)
-                self.tb_writer.flush()
 
     def get_train_dataloader(self):
         return self.dataloader
@@ -416,6 +411,9 @@ class GRPOTrainer(Trainer):
             state = {
                 "global_step": self.state.global_step,
                 "episode": self.state.episode,
+                "accumulate_rewards": getattr(self, "_accumulate_rewards", []),
+                "accumulate_answer_acc": getattr(self, "_accumulate_answer_acc", []),
+                "skipped_groups": getattr(self, "_skipped_groups", 0),
             }
             with open(os.path.join(output_dir, "trainer_state.json"), "w") as f:
                 json.dump(state, f)
@@ -508,7 +506,15 @@ class GRPOTrainer(Trainer):
                 resume_step = saved["global_step"]
                 self.state.global_step = resume_step
                 self.state.episode = saved["episode"]
+                for _ in range(resume_step):
+                    self.lr_scheduler.step()
+                self._resume_accumulate_rewards = saved.get("accumulate_rewards", [])
+                self._resume_accumulate_answer_acc = saved.get("accumulate_answer_acc", [])
+                self._resume_skipped_groups = saved.get("skipped_groups", 0)
                 accelerator.print(f"  Resuming from step {resume_step}, episode {self.state.episode}")
+                accelerator.print(f"  LR scheduler fast-forwarded to step {resume_step}, "
+                                  f"current lr={self.lr_scheduler.get_last_lr()[0]:.6e}")
+                accelerator.print(f"  Restored running avg from {len(self._resume_accumulate_rewards)} samples")
 
         if args.logging_steps and args.logging_steps >= 1:
             self.state.logging_steps = args.logging_steps
@@ -517,9 +523,9 @@ class GRPOTrainer(Trainer):
         if args.save_steps and args.save_steps >= 1:
             self.state.save_steps = args.save_steps
 
-        accumulate_rewards = []
-        accumulate_answer_acc = []
-        skipped_groups = 0
+        accumulate_rewards = getattr(self, "_resume_accumulate_rewards", []).copy()
+        accumulate_answer_acc = getattr(self, "_resume_accumulate_answer_acc", []).copy()
+        skipped_groups = getattr(self, "_resume_skipped_groups", 0)
 
         pbar = tqdm(range(1, args.num_total_batches + 1), desc="DAPO", disable=not accelerator.is_main_process,
                     initial=resume_step, total=args.num_total_batches)
@@ -550,6 +556,8 @@ class GRPOTrainer(Trainer):
                     query = queries[q_idx: q_idx + 1]
                     query_repeated = query.repeat(args.group_size, 1)
 
+                    torch.cuda.empty_cache()
+
                     with unwrap_model_for_generation(model, accelerator) as unwrapped:
                         gen_output = unwrapped.generate(
                             query_repeated,
@@ -571,12 +579,19 @@ class GRPOTrainer(Trainer):
                     full_seqs = torch.cat([query.repeat(args.group_size, 1), responses], dim=1)
                     attn_mask = (full_seqs != processing_class.pad_token_id).long()
 
-                    # Old policy log-probs (no grad, for ratio computation)
-                    policy_out = model(full_seqs, attention_mask=attn_mask)
-                    logits = policy_out.logits[:, context_length - 1: -1]
-                    logits = logits / (args.temperature + 1e-7)
-                    log_probs = F.log_softmax(logits, dim=-1)
-                    old_token_lp = torch.gather(log_probs, 2, responses.unsqueeze(-1)).squeeze(-1)
+                    torch.cuda.empty_cache()
+
+                    old_token_lp_list = []
+                    for k in range(args.group_size):
+                        single_out = model(full_seqs[k:k+1], attention_mask=attn_mask[k:k+1])
+                        single_logits = single_out.logits[:, context_length - 1: -1]
+                        single_logits = single_logits / (args.temperature + 1e-7)
+                        single_lp = F.log_softmax(single_logits, dim=-1)
+                        single_old_lp = torch.gather(single_lp, 2, responses[k:k+1].unsqueeze(-1)).squeeze(-1)
+                        old_token_lp_list.append(single_old_lp)
+                        del single_out, single_logits, single_lp
+                    torch.cuda.empty_cache()
+                    old_token_lp = torch.cat(old_token_lp_list, dim=0)
 
                     response_mask = (responses != processing_class.pad_token_id).float()
                     old_token_lp = old_token_lp * response_mask
@@ -602,15 +617,16 @@ class GRPOTrainer(Trainer):
                             reward = reward * args.overlong_factor
                         group_rewards.append(reward)
                         group_answer_acc.append(info["answer"])
+                        torch.cuda.empty_cache()
 
                     rewards_tensor = torch.tensor(group_rewards, device=device, dtype=torch.float32)
+                    rewards_tensor = torch.clamp(rewards_tensor, min=-10.0, max=10.0)
 
                     # [DAPO] Dynamic sampling: skip groups with no reward variance
                     if args.dynamic_sampling and rewards_tensor.std() < 1e-6:
                         skipped_groups += 1
                         accumulate_rewards.append(rewards_tensor.mean().item())
                         accumulate_answer_acc.append(sum(group_answer_acc) / len(group_answer_acc))
-                        del policy_out, logits, log_probs
                         torch.cuda.empty_cache()
                         continue
 
@@ -630,7 +646,6 @@ class GRPOTrainer(Trainer):
                     accumulate_rewards.append(mean_r.item())
                     accumulate_answer_acc.append(all_answer_accs[-1])
 
-                    del policy_out, logits, log_probs
                     torch.cuda.empty_cache()
 
             # ----- Step 3: DAPO policy gradient update -----
@@ -713,6 +728,9 @@ class GRPOTrainer(Trainer):
                     )
 
             if args.save_steps and self.state.global_step % args.save_steps == 0:
+                self._accumulate_rewards = accumulate_rewards
+                self._accumulate_answer_acc = accumulate_answer_acc
+                self._skipped_groups = skipped_groups
                 self.save_model(os.path.join(args.output_dir, f"checkpoint-{self.state.global_step}"))
                 accelerator.print(f"  Saved checkpoint at step {self.state.global_step}")
 
@@ -720,6 +738,9 @@ class GRPOTrainer(Trainer):
             torch.cuda.empty_cache()
             gc.collect()
 
+        self._accumulate_rewards = accumulate_rewards
+        self._accumulate_answer_acc = accumulate_answer_acc
+        self._skipped_groups = skipped_groups
         self.save_model(os.path.join(args.output_dir, "final"))
         if self.tb_writer is not None:
             self.tb_writer.close()
