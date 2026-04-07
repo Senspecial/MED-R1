@@ -102,7 +102,8 @@ class GRPODataset(torch.utils.data.Dataset):
     def _tokenize(self, da):
         message = [{"role": "user", "content": da["question"]}]
         prompt = self.tokenizer.apply_chat_template(
-            message, tokenize=False, add_generation_prompt=True
+            message, tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,
         )
         tokens = self.tokenizer(prompt, padding=False, truncation=False, add_special_tokens=False)
         da["input_ids"] = tokens["input_ids"]
