@@ -29,10 +29,10 @@ class GRPOConfig:
     # Reward composition:
     #   total = answer_reward_weight * answer + prm_reward_weight * prm
     #   (bad format → format_penalty)
-    prm_agg: str = "min"  # "min", "mean", "last", "weighted_mean"
-    prm_reward_weight: float = 0.5
+    prm_agg: str = "mean"  # "min", "mean", "last", "weighted_mean"
+    prm_reward_weight: float = 0.1
     answer_reward_weight: float = 1.0
-    format_penalty: float = -0.5
+    format_penalty: float = -1.0
 
     # DAPO: asymmetric clipping — larger upper bound to encourage exploration
     clip_range_low: float = 0.2
@@ -61,7 +61,7 @@ class GRPOConfig:
     warmup_ratio: float = 0.05
     bf16: bool = True
     fp16: bool = False
-    gradient_checkpointing: bool = True
+    gradient_checkpointing: bool = False
 
     # Logging & saving
     output_dir: str = "./ckpts/dapo"

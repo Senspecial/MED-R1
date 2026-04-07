@@ -15,6 +15,7 @@ Core algorithm (differences from GRPO marked with [DAPO]):
         7. [DAPO] No KL penalty — policy constrained by clipping alone
 """
 
+import contextlib
 import gc
 import os
 import re
@@ -55,6 +56,12 @@ def unwrap_model_for_generation(model, accelerator):
         getattr(accelerator.state, "deepspeed_plugin", None) is not None
         and accelerator.state.deepspeed_plugin.zero_stage == 3
     )
+
+    original_use_cache = unwrapped.config.use_cache
+    unwrapped.config.use_cache = True
+
+    accelerator.wait_for_everyone()
+
     if is_zero3:
         import deepspeed
         with deepspeed.zero.GatheredParameters(unwrapped.parameters()):
@@ -65,6 +72,10 @@ def unwrap_model_for_generation(model, accelerator):
         unwrapped.eval()
         yield unwrapped
         unwrapped.train()
+
+    accelerator.wait_for_everyone()
+
+    unwrapped.config.use_cache = original_use_cache
 
 
 class OnlineTrainerState(TrainerState):
@@ -263,9 +274,7 @@ class GRPOTrainer(Trainer):
         self.optimizer_cls_and_kwargs = None
 
         args = config
-        accelerator = Accelerator(
-            gradient_accumulation_steps=args.gradient_accumulation_steps
-        )
+        accelerator = Accelerator()
         self.accelerator = accelerator
 
         args.world_size = accelerator.num_processes
@@ -527,204 +536,247 @@ class GRPOTrainer(Trainer):
         accumulate_answer_acc = getattr(self, "_resume_accumulate_answer_acc", []).copy()
         skipped_groups = getattr(self, "_resume_skipped_groups", 0)
 
+        gas = args.gradient_accumulation_steps
         pbar = tqdm(range(1, args.num_total_batches + 1), desc="DAPO", disable=not accelerator.is_main_process,
                     initial=resume_step, total=args.num_total_batches)
         for update in pbar:
             self.state.episode += args.batch_size
-            data = next(iter_dataloader)
 
             if update <= resume_step:
+                for _ in range(gas):
+                    next(iter_dataloader)
                 continue
 
-            with torch.no_grad():
-                queries = data["input_ids"].to(device)
-                questions = data["question"]
-                answers = data["answer"]
-                context_length = queries.shape[1]
-                B = queries.shape[0]
+            # ===== Accumulate gradients across micro-batches =====
+            optimizer.zero_grad()
+            step_pg_loss = 0.0
+            step_total_valid = 0
+            step_all_rewards = []
+            step_all_answer_accs = []
+            step_sample_resp = None
+            step_sample_q = None
+            step_sample_gt = None
+            step_sample_reward = None
+            step_sample_acc = None
 
-                # ----- Step 1: Generate K responses per query -----
-                all_responses = []
-                all_old_log_probs = []
-                all_rewards = []
-                all_advantages = []
-                all_answer_accs = []
-                all_response_masks = []
-                valid_indices = []
+            for micro_step in range(gas):
+                data = next(iter_dataloader)
 
-                for q_idx in range(B):
-                    query = queries[q_idx: q_idx + 1]
-                    query_repeated = query.repeat(args.group_size, 1)
+                with torch.no_grad():
+                    queries = data["input_ids"].to(device)
+                    questions = data["question"]
+                    answers = data["answer"]
+                    context_length = queries.shape[1]
+                    B = queries.shape[0]
 
-                    torch.cuda.empty_cache()
+                    micro_responses = []
+                    micro_old_log_probs = []
+                    micro_rewards = []
+                    micro_advantages = []
+                    micro_answer_accs = []
+                    micro_response_masks = []
+                    micro_valid_indices = []
+                    micro_queries = queries
 
-                    with unwrap_model_for_generation(model, accelerator) as unwrapped:
-                        gen_output = unwrapped.generate(
-                            query_repeated,
-                            generation_config=generation_config,
-                            pad_token_id=processing_class.pad_token_id,
-                            return_dict_in_generate=True,
-                            output_scores=False,
-                        )
-                    query_responses = gen_output.sequences
-                    responses = query_responses[:, context_length:]
+                    for q_idx in range(B):
+                        query = queries[q_idx: q_idx + 1]
+                        query_repeated = query.repeat(args.group_size, 1)
 
-                    if processing_class.eos_token_id is not None:
-                        responses = truncate_response(
-                            processing_class.eos_token_id,
-                            processing_class.pad_token_id,
-                            responses,
-                        )
-
-                    full_seqs = torch.cat([query.repeat(args.group_size, 1), responses], dim=1)
-                    attn_mask = (full_seqs != processing_class.pad_token_id).long()
-
-                    torch.cuda.empty_cache()
-
-                    old_token_lp_list = []
-                    for k in range(args.group_size):
-                        single_out = model(full_seqs[k:k+1], attention_mask=attn_mask[k:k+1])
-                        single_logits = single_out.logits[:, context_length - 1: -1]
-                        single_logits = single_logits / (args.temperature + 1e-7)
-                        single_lp = F.log_softmax(single_logits, dim=-1)
-                        single_old_lp = torch.gather(single_lp, 2, responses[k:k+1].unsqueeze(-1)).squeeze(-1)
-                        old_token_lp_list.append(single_old_lp)
-                        del single_out, single_logits, single_lp
-                    torch.cuda.empty_cache()
-                    old_token_lp = torch.cat(old_token_lp_list, dim=0)
-
-                    response_mask = (responses != processing_class.pad_token_id).float()
-                    old_token_lp = old_token_lp * response_mask
-
-                    # Check which responses were truncated (no EOS)
-                    contains_eos = torch.any(
-                        responses == processing_class.eos_token_id, dim=-1
-                    )  # (K,)
-
-                    # ----- Step 2: Combined reward (PRM + answer) -----
-                    prm_device = self.prm_model.backbone.device
-                    group_rewards = []
-                    group_answer_acc = []
-                    for k in range(args.group_size):
-                        resp_text = processing_class.decode(responses[k], skip_special_tokens=True)
-                        reward, info = compute_reward(
-                            self.prm_model, self.prm_tokenizer,
-                            questions[q_idx], resp_text, answers[q_idx],
-                            args, prm_device,
-                        )
-                        # [DAPO] Overlong shaping: discount reward for truncated responses
-                        if not contains_eos[k].item():
-                            reward = reward * args.overlong_factor
-                        group_rewards.append(reward)
-                        group_answer_acc.append(info["answer"])
                         torch.cuda.empty_cache()
 
-                    rewards_tensor = torch.tensor(group_rewards, device=device, dtype=torch.float32)
-                    rewards_tensor = torch.clamp(rewards_tensor, min=-10.0, max=10.0)
+                        for name, p in model.named_parameters():
+                            if p.requires_grad and torch.isnan(p).any():
+                                accelerator.print(f"[NaN DETECTED] param={name} at step {self.state.global_step}")
+                                break
 
-                    # [DAPO] Dynamic sampling: skip groups with no reward variance
-                    if args.dynamic_sampling and rewards_tensor.std() < 1e-6:
-                        skipped_groups += 1
-                        accumulate_rewards.append(rewards_tensor.mean().item())
-                        accumulate_answer_acc.append(sum(group_answer_acc) / len(group_answer_acc))
+                        with unwrap_model_for_generation(model, accelerator) as unwrapped:
+                            gen_output = unwrapped.generate(
+                                query_repeated,
+                                generation_config=generation_config,
+                                pad_token_id=processing_class.pad_token_id,
+                                return_dict_in_generate=True,
+                                output_scores=False,
+                            )
+                        query_responses = gen_output.sequences
+                        responses = query_responses[:, context_length:]
+
+                        if processing_class.eos_token_id is not None:
+                            responses = truncate_response(
+                                processing_class.eos_token_id,
+                                processing_class.pad_token_id,
+                                responses,
+                            )
+
+                        full_seqs = torch.cat([query.repeat(args.group_size, 1), responses], dim=1)
+                        attn_mask = (full_seqs != processing_class.pad_token_id).long()
+
                         torch.cuda.empty_cache()
-                        continue
 
-                    # Group-relative advantage
-                    mean_r = rewards_tensor.mean()
-                    std_r = rewards_tensor.std() + 1e-8
-                    advantages = (rewards_tensor - mean_r) / std_r
+                        old_token_lp_list = []
+                        for k in range(args.group_size):
+                            single_out = model(full_seqs[k:k+1], attention_mask=attn_mask[k:k+1], use_cache=False)
+                            single_logits = single_out.logits[:, context_length - 1: -1]
+                            single_logits = single_logits / (args.temperature + 1e-7)
+                            single_lp = F.log_softmax(single_logits, dim=-1)
+                            single_old_lp = torch.gather(single_lp, 2, responses[k:k+1].unsqueeze(-1)).squeeze(-1)
+                            old_token_lp_list.append(single_old_lp)
+                            del single_out, single_logits, single_lp
+                        torch.cuda.empty_cache()
+                        old_token_lp = torch.cat(old_token_lp_list, dim=0)
 
-                    valid_indices.append(q_idx)
-                    all_responses.append(responses)
-                    all_old_log_probs.append(old_token_lp)
-                    all_rewards.append(rewards_tensor)
-                    all_advantages.append(advantages)
-                    all_response_masks.append(response_mask)
-                    all_answer_accs.append(sum(group_answer_acc) / len(group_answer_acc))
+                        response_mask = (responses != processing_class.pad_token_id).float()
+                        old_token_lp = old_token_lp * response_mask
 
-                    accumulate_rewards.append(mean_r.item())
-                    accumulate_answer_acc.append(all_answer_accs[-1])
+                        contains_eos = torch.any(
+                            responses == processing_class.eos_token_id, dim=-1
+                        )
 
-                    torch.cuda.empty_cache()
+                        prm_device = self.prm_model.backbone.device
+                        group_rewards = []
+                        group_answer_acc = []
+                        for k in range(args.group_size):
+                            resp_text = processing_class.decode(responses[k], skip_special_tokens=True)
+                            reward, info = compute_reward(
+                                self.prm_model, self.prm_tokenizer,
+                                questions[q_idx], resp_text, answers[q_idx],
+                                args, prm_device,
+                            )
+                            if not contains_eos[k].item():
+                                if reward > 0:
+                                    reward = reward * args.overlong_factor
+                                else:
+                                    reward = reward - 1.0
+                            group_rewards.append(reward)
+                            group_answer_acc.append(info["answer"])
+                            torch.cuda.empty_cache()
 
-            # ----- Step 3: DAPO policy gradient update -----
-            n_valid = len(valid_indices)
-            if n_valid == 0:
-                # All groups were skipped — no gradient this step
+                        rewards_tensor = torch.tensor(group_rewards, device=device, dtype=torch.float32)
+                        rewards_tensor = torch.clamp(rewards_tensor, min=-10.0, max=10.0)
+
+                        if args.dynamic_sampling and rewards_tensor.std() < 1e-6:
+                            skipped_groups += 1
+                            accumulate_rewards.append(rewards_tensor.mean().item())
+                            accumulate_answer_acc.append(sum(group_answer_acc) / len(group_answer_acc))
+                            torch.cuda.empty_cache()
+                            continue
+
+                        has_correct = any(a > 0.5 for a in group_answer_acc)
+                        if not has_correct:
+                            skipped_groups += 1
+                            accumulate_rewards.append(rewards_tensor.mean().item())
+                            accumulate_answer_acc.append(0.0)
+                            torch.cuda.empty_cache()
+                            continue
+
+                        mean_r = rewards_tensor.mean()
+                        std_r = rewards_tensor.std() + 1e-8
+                        advantages = (rewards_tensor - mean_r) / std_r
+
+                        micro_valid_indices.append(q_idx)
+                        micro_responses.append(responses)
+                        micro_old_log_probs.append(old_token_lp)
+                        micro_rewards.append(rewards_tensor)
+                        micro_advantages.append(advantages)
+                        micro_response_masks.append(response_mask)
+                        micro_answer_accs.append(sum(group_answer_acc) / len(group_answer_acc))
+
+                        accumulate_rewards.append(mean_r.item())
+                        accumulate_answer_acc.append(micro_answer_accs[-1])
+
+                        torch.cuda.empty_cache()
+
+                # ----- Backward for this micro-batch (with grad) -----
+                n_micro_valid = len(micro_valid_indices)
+                if n_micro_valid > 0:
+                    for i, q_idx in enumerate(micro_valid_indices):
+                        responses = micro_responses[i]
+                        old_token_lp = micro_old_log_probs[i]
+                        adv = micro_advantages[i]
+                        response_mask = micro_response_masks[i]
+
+                        query = micro_queries[q_idx: q_idx + 1].repeat(args.group_size, 1)
+                        full_seqs = torch.cat([query, responses], dim=1)
+                        attn_mask = (full_seqs != processing_class.pad_token_id).long()
+
+                        policy_out = model(full_seqs, attention_mask=attn_mask, use_cache=False)
+                        new_logits = policy_out.logits[:, context_length - 1: -1]
+                        new_logits = new_logits / (args.temperature + 1e-7)
+                        new_log_probs = F.log_softmax(new_logits, dim=-1)
+                        new_token_lp = torch.gather(new_log_probs, 2, responses.unsqueeze(-1)).squeeze(-1)
+                        new_token_lp = new_token_lp * response_mask
+
+                        pg_loss = self._dapo_policy_loss(
+                            new_token_lp, old_token_lp.detach(),
+                            adv.detach(), response_mask,
+                            args.clip_range_low, args.clip_range_high,
+                        )
+
+                        accelerator.backward(pg_loss / (n_micro_valid * gas))
+                        step_pg_loss += pg_loss.detach().item()
+
+                        del policy_out, new_logits, new_log_probs, new_token_lp
+                        torch.cuda.empty_cache()
+
+                    step_total_valid += n_micro_valid
+                    step_all_rewards.extend(micro_rewards)
+                    step_all_answer_accs.extend(micro_answer_accs)
+
+                    if step_sample_resp is None:
+                        step_sample_resp = processing_class.decode(micro_responses[0][0], skip_special_tokens=True)
+                        step_sample_q = questions[micro_valid_indices[0]]
+                        step_sample_gt = answers[micro_valid_indices[0]]
+                        step_sample_reward = micro_rewards[0][0].item()
+                        step_sample_acc = micro_answer_accs[0]
+
+                del micro_responses, micro_old_log_probs, micro_rewards, micro_advantages, micro_response_masks
+                torch.cuda.empty_cache()
+
+            # ===== Optimizer step (once per macro-batch) =====
+            if step_total_valid == 0:
                 optimizer.zero_grad()
                 self.state.global_step += 1
                 continue
 
-            total_pg_loss = torch.tensor(0.0, device=device)
-
-            for i, q_idx in enumerate(valid_indices):
-                responses = all_responses[i]
-                old_token_lp = all_old_log_probs[i]
-                advantages = all_advantages[i]
-                response_mask = all_response_masks[i]
-
-                query = queries[q_idx: q_idx + 1].repeat(args.group_size, 1)
-                full_seqs = torch.cat([query, responses], dim=1)
-                attn_mask = (full_seqs != processing_class.pad_token_id).long()
-
-                # New policy log-probs (with grad)
-                policy_out = model(full_seqs, attention_mask=attn_mask)
-                new_logits = policy_out.logits[:, context_length - 1: -1]
-                new_logits = new_logits / (args.temperature + 1e-7)
-                new_log_probs = F.log_softmax(new_logits, dim=-1)
-                new_token_lp = torch.gather(new_log_probs, 2, responses.unsqueeze(-1)).squeeze(-1)
-                new_token_lp = new_token_lp * response_mask
-
-                # [DAPO] Token-level clipped surrogate with asymmetric clipping
-                pg_loss = self._dapo_policy_loss(
-                    new_token_lp, old_token_lp.detach(),
-                    advantages.detach(), response_mask,
-                    args.clip_range_low, args.clip_range_high,
-                )
-
-                # [DAPO] No KL penalty — clipping alone constrains the policy
-                accelerator.backward(pg_loss / n_valid)
-                total_pg_loss += pg_loss.detach()
-
-                del policy_out, new_logits, new_log_probs, new_token_lp
-                torch.cuda.empty_cache()
-
-            optimizer.step()
+            grad_norm = accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+            if math.isnan(grad_norm_val) or math.isinf(grad_norm_val):
+                accelerator.print(f"[WARNING] grad_norm={grad_norm_val} at step {self.state.global_step}, skipping update")
+                optimizer.zero_grad()
+            else:
+                optimizer.step()
+                optimizer.zero_grad()
             self.lr_scheduler.step()
-            optimizer.zero_grad()
 
             # Logging
             with torch.no_grad():
-                avg_reward = sum(r.mean().item() for r in all_rewards) / max(n_valid, 1)
-                avg_answer_acc = sum(all_answer_accs) / max(n_valid, 1)
+                avg_reward = sum(r.mean().item() for r in step_all_rewards) / max(step_total_valid, 1)
+                avg_answer_acc = sum(step_all_answer_accs) / max(step_total_valid, 1)
                 recent_n = min(50, len(accumulate_rewards))
                 metrics = {
-                    "loss/pg": total_pg_loss.item() / max(n_valid, 1),
+                    "loss/pg": step_pg_loss / max(step_total_valid, 1),
                     "reward/mean": avg_reward,
                     "reward/running_avg": sum(accumulate_rewards[-recent_n:]) / max(recent_n, 1),
                     "reward/answer_acc": avg_answer_acc,
                     "reward/answer_acc_running": sum(accumulate_answer_acc[-recent_n:]) / max(recent_n, 1),
                     "dapo/skipped_groups_total": skipped_groups,
-                    "dapo/valid_groups_this_step": n_valid,
+                    "dapo/valid_groups_this_step": step_total_valid,
                     "lr": self.lr_scheduler.get_last_lr()[0],
                     "episode": self.state.episode,
                 }
                 self.state.epoch = self.state.episode / self.train_dataset_len
                 self.state.global_step += 1
                 self.log(metrics)
-                pbar.set_postfix(loss=total_pg_loss.item() / max(n_valid, 1), reward=avg_reward, acc=avg_answer_acc)
+                pbar.set_postfix(loss=step_pg_loss / max(step_total_valid, 1), reward=avg_reward, acc=avg_answer_acc)
 
-                if random.random() < 0.05 and n_valid > 0:
-                    sample_resp = processing_class.decode(all_responses[0][0], skip_special_tokens=True)
+                if random.random() < 0.1 and step_sample_resp is not None:
                     accelerator.print(
                         f"\n[Step {self.state.global_step}] "
-                        f"reward={all_rewards[0][0].item():.3f} "
-                        f"ans_acc={all_answer_accs[0]:.2f} "
+                        f"reward={step_sample_reward:.3f} "
+                        f"ans_acc={step_sample_acc:.2f} "
                         f"skipped={skipped_groups}\n"
-                        f"Q: {questions[valid_indices[0]][:100]}...\n"
-                        f"GT: {answers[valid_indices[0]][:100]}\n"
-                        f"A: {sample_resp[:300]}...\n"
+                        f"Q: {step_sample_q[:100]}...\n"
+                        f"GT: {step_sample_gt[:100]}\n"
+                        f"A: {step_sample_resp[:]}\n"
                     )
 
             if args.save_steps and self.state.global_step % args.save_steps == 0:
@@ -734,7 +786,7 @@ class GRPOTrainer(Trainer):
                 self.save_model(os.path.join(args.output_dir, f"checkpoint-{self.state.global_step}"))
                 accelerator.print(f"  Saved checkpoint at step {self.state.global_step}")
 
-            del all_responses, all_old_log_probs, all_rewards, all_advantages, all_response_masks
+            del step_all_rewards, step_all_answer_accs
             torch.cuda.empty_cache()
             gc.collect()
 
