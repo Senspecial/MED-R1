@@ -54,6 +54,39 @@ Usage:
         --output_dir ./ckpts/dapo_qlora \
         --group_size 8 \
         --per_device_batch_size 1
+
+    # ---- With vLLM generation acceleration (2-machine 16-GPU example) ----
+    #
+    # Terminal 1 — start vLLM server on GPU 7 of machine 0:
+    #   bash run/start_vllm_server.sh /tmp/sft_model 7 8000
+    #
+    # Terminal 2 — launch training on GPU 0-6 of machine 0 + all 8 GPUs of machine 1:
+    #   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 accelerate launch \
+    #       --config_file configs/deepspeed_zero2.yaml \
+    #       --num_processes 15 \
+    #       --num_machines 2 \
+    #       --machine_rank 0 \
+    #       --main_process_ip <MACHINE_0_IP> \
+    #       --main_process_port 29500 \
+    #       --deepspeed_multinode_launcher standard \
+    #       GRPO_stage2.py \
+    #       --model_name_or_path /tmp/sft_model \
+    #       --prm_model_path /tmp/prm_qwen3_4b \
+    #       --dataset_path data/medical_o1_verifiable_problem.json \
+    #       --output_dir ./ckpts/dapo \
+    #       --use_vllm True \
+    #       --vllm_base_url http://localhost:8000 \
+    #       --group_size 8 \
+    #       --temperature 0.7 \
+    #       --learning_rate 5e-7 \
+    #       --total_episodes 20000 \
+    #       --per_device_batch_size 1 \
+    #       --gradient_accumulation_steps 16 \
+    #       --save_steps 50
+    #
+    # Note: vLLM handles generation much faster via PagedAttention + continuous
+    # batching.  To refresh generation weights mid-training, restart the vLLM
+    # server pointing to the latest checkpoint directory.
 """
 
 import os
