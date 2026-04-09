@@ -311,7 +311,7 @@ if __name__ == "__main__":
     random.shuffle(data)
 
     eval_num = min(int(len(data) * config.eval_ratio), config.eval_max_num)
-    train_dataset = GRPODataset(data[eval_num:], tokenizer, debug=1)
+    train_dataset = GRPODataset(data[eval_num:], tokenizer, debug=1 if local_rank == 0 else 0)
     eval_dataset = GRPODataset(data[:eval_num], tokenizer)
 
     # Trainer
