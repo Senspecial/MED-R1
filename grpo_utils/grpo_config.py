@@ -26,11 +26,17 @@ class GRPOConfig:
     max_new_tokens: int = 1024
     top_p: float = 1.0
 
+    # vLLM server (shared by generation acceleration and LLM judge)
+    use_vllm: bool = False
+    use_llm_judge: bool = False
+    vllm_base_url: str = "http://localhost:8000"
+    vllm_model_name: str = ""
+
     # Reward composition:
     #   total = answer_reward_weight * answer + prm_reward_weight * prm
     #   (bad format → format_penalty)
     prm_agg: str = "mean"  # "min", "mean", "last", "weighted_mean"
-    prm_reward_weight: float = 0.1
+    prm_reward_weight: float = 0.3
     answer_reward_weight: float = 1.0
     format_penalty: float = -1.0
 
@@ -55,9 +61,9 @@ class GRPOConfig:
     learning_rate: float = 2e-5
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
-    total_episodes: int = 40000
+    total_episodes: int = 20000
     per_device_batch_size: int = 2
-    gradient_accumulation_steps: int = 16
+    gradient_accumulation_steps: int = 4
     warmup_ratio: float = 0.05
     bf16: bool = True
     fp16: bool = False
@@ -66,7 +72,7 @@ class GRPOConfig:
     # Logging & saving
     output_dir: str = "./ckpts/dapo"
     run_name: str = "dapo_prm"
-    save_steps: int = 200
+    save_steps: int = 25
     save_total_limit: int = 2
     eval_steps: int = 50
     logging_steps: int = 10
