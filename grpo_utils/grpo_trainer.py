@@ -15,39 +15,31 @@ Core algorithm (differences from GRPO marked with [DAPO]):
         7. [DAPO] No KL penalty — policy constrained by clipping alone
 """
 
-import contextlib
 import gc
 import os
 import re
 import time
 import math
 import random
-from collections import defaultdict
-from typing import Optional, Tuple
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
 from accelerate import Accelerator
-from accelerate.utils import broadcast, gather_object
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import (
     GenerationConfig,
     PreTrainedTokenizerBase,
     Trainer,
-    TrainerCallback,
     TrainerControl,
-    is_wandb_available,
+    TrainerState,
 )
-
-from contextlib import contextmanager
-from transformers import TrainerState
 
 
 # ---------------------------------------------------------------------------
-# Inline replacements for trl utilities (torch 2.3.1 compatible)
+# Inline replacements for trl utilities 
 # ---------------------------------------------------------------------------
 @contextmanager
 def unwrap_model_for_generation(model, accelerator):
@@ -58,7 +50,11 @@ def unwrap_model_for_generation(model, accelerator):
     )
 
     original_use_cache = unwrapped.config.use_cache
+    had_gradient_checkpointing = getattr(unwrapped, "is_gradient_checkpointing", False)
+
     unwrapped.config.use_cache = True
+    if had_gradient_checkpointing:
+        unwrapped.gradient_checkpointing_disable()
 
     accelerator.wait_for_everyone()
 
@@ -76,6 +72,10 @@ def unwrap_model_for_generation(model, accelerator):
     accelerator.wait_for_everyone()
 
     unwrapped.config.use_cache = original_use_cache
+    if had_gradient_checkpointing:
+        unwrapped.gradient_checkpointing_enable()
+        if hasattr(unwrapped, "enable_input_require_grads"):
+            unwrapped.enable_input_require_grads()
 
 
 class OnlineTrainerState(TrainerState):
@@ -108,9 +108,6 @@ def truncate_response(eos_token_id, pad_token_id, responses):
     keep = pos <= first_eos.unsqueeze(1)
     return torch.where(keep, responses, pad_token_id)
 
-if is_wandb_available():
-    import wandb
-
 
 # ---------------------------------------------------------------------------
 # PRM wrapper for inference during training
@@ -132,17 +129,21 @@ class PRMScorer(nn.Module):
             input_ids=input_ids, attention_mask=attention_mask,
             output_hidden_states=True,
         )
-        hidden = outputs.hidden_states[-1]  # (1, L, H)
+        hidden = outputs.hidden_states[-1].clone()  # (1, L, H)
+        del outputs
+        seq_len = hidden.size(1)
         scores = []
         for pos in step_end_positions:
+            pos = min(pos, seq_len - 1)
             h = hidden[0, pos]
             s = torch.sigmoid(self.reward_head(h)).item()
             scores.append(s)
+        del hidden
         return scores
 
 
 # ---------------------------------------------------------------------------
-# Response parsing — aligned with SFT format from SFT_stage1.py
+# Response parsing 
 # ---------------------------------------------------------------------------
 THINKING_PATTERN = re.compile(r"## Thinking\n\n(.*?)(?=\n\n## Final Response)", re.S)
 RESPONSE_PATTERN = re.compile(r"## Final Response\n\n(.*)", re.S)
@@ -157,7 +158,7 @@ def extract_thinking_and_response(text):
 
 
 # ---------------------------------------------------------------------------
-# Answer verification — lightweight keyword matching for medical QA
+# Answer verification
 # ---------------------------------------------------------------------------
 def verify_answer(model_answer, ground_truth):
     """
@@ -181,7 +182,83 @@ def verify_answer(model_answer, ground_truth):
 
 
 # ---------------------------------------------------------------------------
-# PRM step scoring — aligned with train_prm.py format
+# LLM-as-Judge answer verification via vLLM server
+# ---------------------------------------------------------------------------
+_JUDGE_TEMPLATE = (
+    "Judge whether the student's answer is correct by comparing it with the "
+    "reference answer. Consider medical synonyms (e.g. 'heart attack' = "
+    "'myocardial infarction') and abbreviations (e.g. 'MI' = 'myocardial "
+    "infarction'). The student may include extra explanation; focus on whether "
+    "the core medical conclusion is equivalent.\n\n"
+    "Question: {question}\n"
+    "Reference answer: {ground_truth}\n"
+    "Student's answer: {model_answer}\n\n"
+    "Respond with ONLY one word: Yes or No."
+)
+
+
+def verify_answer_llm(question, model_answer, ground_truth,
+                       vllm_base_url, vllm_model_name, processing_class):
+    """Use the LLM served by vLLM to judge answer correctness.
+
+    Falls back to keyword matching on any failure.
+    """
+    import requests as _requests
+
+    if not model_answer or not ground_truth:
+        return 0.0
+
+    judge_content = _JUDGE_TEMPLATE.format(
+        question=question,
+        ground_truth=ground_truth,
+        model_answer=model_answer[:500],
+    )
+
+    message = [{"role": "user", "content": judge_content}]
+    prompt_text = processing_class.apply_chat_template(
+        message, tokenize=False, add_generation_prompt=True,
+        enable_thinking=False,
+    )
+
+    try:
+        resp = _requests.post(
+            f"{vllm_base_url}/v1/completions",
+            json={
+                "model": vllm_model_name,
+                "prompt": prompt_text,
+                "max_tokens": 3,
+                "temperature": 0,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["text"].strip().lower()
+        if content.startswith("yes"):
+            return 1.0
+        if content.startswith("no"):
+            return 0.0
+        return verify_answer(model_answer, ground_truth)
+    except Exception:
+        return verify_answer(model_answer, ground_truth)
+
+
+def batch_verify_answers_llm(question, model_answers, ground_truth,
+                              vllm_base_url, vllm_model_name, processing_class):
+    """Judge multiple answers for the same question concurrently."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _judge_one(ans):
+        return verify_answer_llm(
+            question, ans, ground_truth,
+            vllm_base_url, vllm_model_name, processing_class,
+        )
+
+    with ThreadPoolExecutor(max_workers=len(model_answers)) as pool:
+        return list(pool.map(_judge_one, model_answers))
+
+
+# ---------------------------------------------------------------------------
+# PRM step scoring 
 # ---------------------------------------------------------------------------
 def _aggregate_scores(step_scores, agg):
     if not step_scores:
@@ -200,14 +277,37 @@ def _aggregate_scores(step_scores, agg):
 
 def compute_prm_step_scores(prm_model, prm_tokenizer, question, steps, device):
     """Run PRM on the reasoning steps, return per-step scores."""
-    full_text = f"Question: {question}\n\nReasoning:\n\n" + "\n\n".join(steps)
-    full_tokens = prm_tokenizer.encode(full_text, add_special_tokens=True)
+    prefix = f"Question: {question}\n\nReasoning:\n\n"
+    full_text = prefix + "\n\n".join(steps)
 
-    step_end_positions = []
-    for i in range(len(steps)):
-        partial_text = f"Question: {question}\n\nReasoning:\n\n" + "\n\n".join(steps[: i + 1])
-        partial_tokens = prm_tokenizer.encode(partial_text, add_special_tokens=True)
-        step_end_positions.append(len(partial_tokens) - 1)
+    encoding = prm_tokenizer(full_text, add_special_tokens=True, return_offsets_mapping=True)
+    full_tokens = encoding["input_ids"]
+    offsets = encoding.get("offset_mapping")
+
+    if offsets is not None:
+        step_end_chars = []
+        char_pos = len(prefix)
+        for i, step in enumerate(steps):
+            char_pos += len(step)
+            step_end_chars.append(char_pos - 1)
+            if i < len(steps) - 1:
+                char_pos += 2  # "\n\n"
+
+        step_end_positions = []
+        for target in step_end_chars:
+            pos = len(full_tokens) - 1
+            for tok_idx in range(len(offsets)):
+                start, end = offsets[tok_idx]
+                if start <= target < end:
+                    pos = tok_idx
+                    break
+            step_end_positions.append(pos)
+    else:
+        step_end_positions = []
+        for i in range(len(steps)):
+            partial_text = prefix + "\n\n".join(steps[: i + 1])
+            partial_tokens = prm_tokenizer.encode(partial_text, add_special_tokens=True)
+            step_end_positions.append(len(partial_tokens) - 1)
 
     input_ids = torch.LongTensor([full_tokens]).to(device)
     attention_mask = torch.ones_like(input_ids)
@@ -217,17 +317,24 @@ def compute_prm_step_scores(prm_model, prm_tokenizer, question, steps, device):
 # ---------------------------------------------------------------------------
 # Combined reward:  answer verification + PRM process reward + format check
 # ---------------------------------------------------------------------------
-def compute_reward(prm_model, prm_tokenizer, question, response_text, ground_truth, config, device):
+def compute_reward(prm_model, prm_tokenizer, question, response_text, ground_truth,
+                   config, device, ans_reward_override=None):
     """
     Compute the total reward for a single response.
     Returns (total_reward, info_dict).
+
+    If *ans_reward_override* is provided (from LLM judge), it is used
+    instead of keyword matching.
     """
     thinking, final_resp = extract_thinking_and_response(response_text)
 
     if thinking is None or final_resp is None:
         return config.format_penalty, {"answer": 0.0, "prm": 0.0, "format_ok": False}
 
-    ans_reward = verify_answer(final_resp, ground_truth)
+    if ans_reward_override is not None:
+        ans_reward = ans_reward_override
+    else:
+        ans_reward = verify_answer(final_resp, ground_truth)
 
     steps = [s.strip() for s in thinking.split("\n\n") if s.strip()]
     if not steps:
@@ -319,10 +426,6 @@ class GRPOTrainer(Trainer):
             os.makedirs(self.args.output_dir, exist_ok=True)
 
         self.tb_writer = None
-        if accelerator.is_main_process:
-            from torch.utils.tensorboard import SummaryWriter
-            self.tb_writer = SummaryWriter(log_dir=os.path.join(args.output_dir, "tb_logs"))
-
         self.hub_model_id = None
 
         # Dataloader
@@ -334,8 +437,8 @@ class GRPOTrainer(Trainer):
             drop_last=True,
         )
         torch.manual_seed(args.seed)
-        self.model, self.optimizer, self.dataloader = accelerator.prepare(
-            self.model, self.optimizer, self.dataloader
+        self.model, self.optimizer, self.dataloader, self.lr_scheduler = accelerator.prepare(
+            self.model, self.optimizer, self.dataloader, self.lr_scheduler
         )
         torch.manual_seed(self.local_seed)
 
@@ -377,6 +480,25 @@ class GRPOTrainer(Trainer):
             os.makedirs(log_dir, exist_ok=True)
             self.tb_writer = SummaryWriter(log_dir=log_dir)
             self.accelerator.print(f"TensorBoard logging to {log_dir}")
+
+        if args.use_vllm or args.use_llm_judge:
+            import requests as _requests
+            try:
+                r = _requests.get(f"{args.vllm_base_url}/v1/models", timeout=10)
+                r.raise_for_status()
+                model_ids = [m["id"] for m in r.json().get("data", [])]
+                accelerator.print(f"vLLM server connected at {args.vllm_base_url}, models: {model_ids}")
+                if args.use_vllm:
+                    accelerator.print("  → vLLM used for generation (off-policy)")
+                else:
+                    accelerator.print("  → Generation uses training model (on-policy)")
+                if args.use_llm_judge:
+                    accelerator.print("  → LLM Judge enabled for answer verification")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Cannot reach vLLM server at {args.vllm_base_url}: {e}\n"
+                    f"Start it first: bash run/start_vllm_server.sh {args.model_name_or_path}"
+                )
 
     def log(self, logs, start_time=None):
         if self.accelerator.is_main_process:
@@ -435,6 +557,83 @@ class GRPOTrainer(Trainer):
                 if name.startswith("policy.")
             }
         super()._save(output_dir, state_dict)
+
+    # ------------------------------------------------------------------
+    # vLLM generation helpers
+    # ------------------------------------------------------------------
+    def _resolve_vllm_model_name(self):
+        """Resolve vLLM model name once and cache it."""
+        if getattr(self, "_vllm_model_name_resolved", None):
+            return self._vllm_model_name_resolved
+
+        import requests as _requests
+        if self.args.vllm_model_name:
+            self._vllm_model_name_resolved = self.args.vllm_model_name
+        else:
+            try:
+                r = _requests.get(f"{self.args.vllm_base_url}/v1/models", timeout=10)
+                r.raise_for_status()
+                models = r.json().get("data", [])
+                if models:
+                    self._vllm_model_name_resolved = models[0]["id"]
+                else:
+                    self._vllm_model_name_resolved = self.args.model_name_or_path
+            except Exception:
+                self._vllm_model_name_resolved = self.args.model_name_or_path
+        return self._vllm_model_name_resolved
+
+    def _generate_vllm(self, prompt_text, n, max_retries=3):
+        """Generate *n* completions for a single prompt via the vLLM server."""
+        import requests as _requests
+
+        url = f"{self.args.vllm_base_url}/v1/completions"
+        model_name = self._resolve_vllm_model_name()
+        payload = {
+            "model": model_name,
+            "prompt": prompt_text,
+            "n": n,
+            "max_tokens": self.args.max_new_tokens,
+            "temperature": self.args.temperature + 1e-7,
+            "top_p": self.args.top_p,
+        }
+        for attempt in range(max_retries):
+            try:
+                resp = _requests.post(url, json=payload, timeout=600)
+                resp.raise_for_status()
+                choices = sorted(resp.json()["choices"], key=lambda x: x["index"])
+                texts = [c["text"] for c in choices]
+                finish_reasons = [c.get("finish_reason", "length") for c in choices]
+                return texts, finish_reasons
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    self.accelerator.print(
+                        f"[vLLM ERROR] Failed after {max_retries} attempts: {e}"
+                    )
+                    return [""] * n, ["length"] * n
+                self.accelerator.print(
+                    f"[vLLM WARN] Attempt {attempt+1}/{max_retries} failed: {e}, retrying..."
+                )
+                time.sleep(2 ** attempt)
+        return [""] * n, ["length"] * n
+
+    def _texts_to_response_tensor(self, response_texts, finish_reasons, max_len, device):
+        """Convert generated texts to a padded response token-ID tensor."""
+        pad_id = self.processing_class.pad_token_id
+        eos_id = self.processing_class.eos_token_id
+
+        all_ids = []
+        for text, reason in zip(response_texts, finish_reasons):
+            ids = self.processing_class.encode(text, add_special_tokens=False)
+            if not ids:
+                ids = [pad_id]
+            if reason == "stop" and eos_id is not None and ids[-1] != eos_id:
+                ids.append(eos_id)
+            ids = ids[:max_len]
+            all_ids.append(ids)
+
+        max_resp_len = max(len(ids) for ids in all_ids)
+        padded = [ids + [pad_id] * (max_resp_len - len(ids)) for ids in all_ids]
+        return torch.LongTensor(padded).to(device)
 
     # ------------------------------------------------------------------
     # DAPO token-level clipped surrogate loss
@@ -540,12 +739,12 @@ class GRPOTrainer(Trainer):
         pbar = tqdm(range(1, args.num_total_batches + 1), desc="DAPO", disable=not accelerator.is_main_process,
                     initial=resume_step, total=args.num_total_batches)
         for update in pbar:
-            self.state.episode += args.batch_size
-
             if update <= resume_step:
                 for _ in range(gas):
                     next(iter_dataloader)
                 continue
+
+            self.state.episode += args.batch_size
 
             # ===== Accumulate gradients across micro-batches =====
             optimizer.zero_grad()
@@ -580,49 +779,72 @@ class GRPOTrainer(Trainer):
 
                     for q_idx in range(B):
                         query = queries[q_idx: q_idx + 1]
-                        query_repeated = query.repeat(args.group_size, 1)
 
                         torch.cuda.empty_cache()
 
-                        for name, p in model.named_parameters():
-                            if p.requires_grad and torch.isnan(p).any():
-                                accelerator.print(f"[NaN DETECTED] param={name} at step {self.state.global_step}")
-                                break
-
-                        with unwrap_model_for_generation(model, accelerator) as unwrapped:
-                            gen_output = unwrapped.generate(
-                                query_repeated,
-                                generation_config=generation_config,
-                                pad_token_id=processing_class.pad_token_id,
-                                return_dict_in_generate=True,
-                                output_scores=False,
+                        if args.use_vllm:
+                            message = [{"role": "user", "content": questions[q_idx]}]
+                            prompt_text = processing_class.apply_chat_template(
+                                message, tokenize=False, add_generation_prompt=True,
+                                enable_thinking=False,
                             )
-                        query_responses = gen_output.sequences
-                        responses = query_responses[:, context_length:]
-
-                        if processing_class.eos_token_id is not None:
-                            responses = truncate_response(
-                                processing_class.eos_token_id,
-                                processing_class.pad_token_id,
-                                responses,
+                            resp_texts, finish_reasons = self._generate_vllm(
+                                prompt_text, args.group_size,
                             )
+                            responses = self._texts_to_response_tensor(
+                                resp_texts, finish_reasons,
+                                args.max_new_tokens, device,
+                            )
+                        else:
+                            query_repeated = query.repeat(args.group_size, 1)
+                            query_attn_mask = (query_repeated != processing_class.pad_token_id).long()
+                            with unwrap_model_for_generation(model, accelerator) as unwrapped:
+                                gen_output = unwrapped.generate(
+                                    query_repeated,
+                                    attention_mask=query_attn_mask,
+                                    generation_config=generation_config,
+                                    pad_token_id=processing_class.pad_token_id,
+                                    return_dict_in_generate=True,
+                                    output_scores=False,
+                                )
+                            query_responses = gen_output.sequences
+                            del gen_output
+                            responses = query_responses[:, context_length:]
+                            del query_responses, query_repeated, query_attn_mask
+
+                            if processing_class.eos_token_id is not None:
+                                responses = truncate_response(
+                                    processing_class.eos_token_id,
+                                    processing_class.pad_token_id,
+                                    responses,
+                                )
 
                         full_seqs = torch.cat([query.repeat(args.group_size, 1), responses], dim=1)
                         attn_mask = (full_seqs != processing_class.pad_token_id).long()
 
                         torch.cuda.empty_cache()
 
-                        old_token_lp_list = []
-                        for k in range(args.group_size):
-                            single_out = model(full_seqs[k:k+1], attention_mask=attn_mask[k:k+1], use_cache=False)
-                            single_logits = single_out.logits[:, context_length - 1: -1]
-                            single_logits = single_logits / (args.temperature + 1e-7)
-                            single_lp = F.log_softmax(single_logits, dim=-1)
-                            single_old_lp = torch.gather(single_lp, 2, responses[k:k+1].unsqueeze(-1)).squeeze(-1)
-                            old_token_lp_list.append(single_old_lp)
-                            del single_out, single_logits, single_lp
+                        _unwrapped = accelerator.unwrap_model(model)
+                        _had_gc = getattr(_unwrapped, "is_gradient_checkpointing", False)
+                        if _had_gc:
+                            _unwrapped.gradient_checkpointing_disable()
+
+                        all_out = model(full_seqs, attention_mask=attn_mask, use_cache=False)
+                        all_logits = all_out.logits[:, context_length - 1: -1]
+                        all_logits = all_logits / (args.temperature + 1e-7)
+                        lp_flat = -F.cross_entropy(
+                            all_logits.reshape(-1, all_logits.size(-1)),
+                            responses.reshape(-1),
+                            reduction="none",
+                        )
+                        old_token_lp = lp_flat.reshape(responses.shape)
+                        del all_out, all_logits, lp_flat
+
+                        if _had_gc:
+                            _unwrapped.gradient_checkpointing_enable()
+                            if hasattr(_unwrapped, "enable_input_require_grads"):
+                                _unwrapped.enable_input_require_grads()
                         torch.cuda.empty_cache()
-                        old_token_lp = torch.cat(old_token_lp_list, dim=0)
 
                         response_mask = (responses != processing_class.pad_token_id).float()
                         old_token_lp = old_token_lp * response_mask
@@ -632,14 +854,40 @@ class GRPOTrainer(Trainer):
                         )
 
                         prm_device = self.prm_model.backbone.device
+
+                        resp_texts_decoded = [
+                            processing_class.decode(responses[k], skip_special_tokens=True)
+                            for k in range(args.group_size)
+                        ]
+
+                        llm_judge_scores = [None] * args.group_size
+                        if args.use_llm_judge:
+                            final_answers = []
+                            for rt in resp_texts_decoded:
+                                _, fa = extract_thinking_and_response(rt)
+                                final_answers.append(fa or "")
+                            llm_judge_scores = batch_verify_answers_llm(
+                                questions[q_idx], final_answers, answers[q_idx],
+                                args.vllm_base_url,
+                                self._resolve_vllm_model_name(),
+                                processing_class,
+                            )
+                            if accelerator.is_main_process and random.random() < 0.05:
+                                n_yes = sum(1 for s in llm_judge_scores if s == 1.0)
+                                accelerator.print(
+                                    f"  [Judge] {n_yes}/{len(llm_judge_scores)} correct  "
+                                    f"GT={answers[q_idx][:60]}  "
+                                    f"sample_ans={final_answers[0][:60]}"
+                                )
+
                         group_rewards = []
                         group_answer_acc = []
                         for k in range(args.group_size):
-                            resp_text = processing_class.decode(responses[k], skip_special_tokens=True)
                             reward, info = compute_reward(
                                 self.prm_model, self.prm_tokenizer,
-                                questions[q_idx], resp_text, answers[q_idx],
+                                questions[q_idx], resp_texts_decoded[k], answers[q_idx],
                                 args, prm_device,
+                                ans_reward_override=llm_judge_scores[k],
                             )
                             if not contains_eos[k].item():
                                 if reward > 0:
@@ -660,17 +908,9 @@ class GRPOTrainer(Trainer):
                             torch.cuda.empty_cache()
                             continue
 
-                        has_correct = any(a > 0.5 for a in group_answer_acc)
-                        if not has_correct:
-                            skipped_groups += 1
-                            accumulate_rewards.append(rewards_tensor.mean().item())
-                            accumulate_answer_acc.append(0.0)
-                            torch.cuda.empty_cache()
-                            continue
-
                         mean_r = rewards_tensor.mean()
-                        std_r = rewards_tensor.std() + 1e-8
-                        advantages = (rewards_tensor - mean_r) / std_r
+                        std_r = rewards_tensor.std() + 1e-4
+                        advantages = torch.clamp((rewards_tensor - mean_r) / std_r, -5.0, 5.0)
 
                         micro_valid_indices.append(q_idx)
                         micro_responses.append(responses)
@@ -686,6 +926,8 @@ class GRPOTrainer(Trainer):
                         torch.cuda.empty_cache()
 
                 # ----- Backward for this micro-batch (with grad) -----
+                # Per-response forward+backward to avoid OOM from batching
+                # all group_size responses at once (activations for 8 seqs is huge).
                 n_micro_valid = len(micro_valid_indices)
                 if n_micro_valid > 0:
                     for i, q_idx in enumerate(micro_valid_indices):
@@ -694,28 +936,41 @@ class GRPOTrainer(Trainer):
                         adv = micro_advantages[i]
                         response_mask = micro_response_masks[i]
 
-                        query = micro_queries[q_idx: q_idx + 1].repeat(args.group_size, 1)
-                        full_seqs = torch.cat([query, responses], dim=1)
-                        attn_mask = (full_seqs != processing_class.pad_token_id).long()
+                        total_resp_tokens = response_mask.sum().clamp(min=1.0)
+                        scale = 1.0 / (n_micro_valid * gas)
+                        group_pg_loss = 0.0
 
-                        policy_out = model(full_seqs, attention_mask=attn_mask, use_cache=False)
-                        new_logits = policy_out.logits[:, context_length - 1: -1]
-                        new_logits = new_logits / (args.temperature + 1e-7)
-                        new_log_probs = F.log_softmax(new_logits, dim=-1)
-                        new_token_lp = torch.gather(new_log_probs, 2, responses.unsqueeze(-1)).squeeze(-1)
-                        new_token_lp = new_token_lp * response_mask
+                        for k in range(args.group_size):
+                            query_k = micro_queries[q_idx: q_idx + 1]
+                            resp_k = responses[k: k + 1]
+                            full_k = torch.cat([query_k, resp_k], dim=1)
+                            mask_k = (full_k != processing_class.pad_token_id).long()
 
-                        pg_loss = self._dapo_policy_loss(
-                            new_token_lp, old_token_lp.detach(),
-                            adv.detach(), response_mask,
-                            args.clip_range_low, args.clip_range_high,
-                        )
+                            out_k = model(full_k, attention_mask=mask_k, use_cache=False)
+                            logits_k = out_k.logits[:, context_length - 1: -1]
+                            logits_k = logits_k / (args.temperature + 1e-7)
+                            lp_k = F.log_softmax(logits_k, dim=-1)
+                            new_lp_k = torch.gather(lp_k, 2, resp_k.unsqueeze(-1)).squeeze(-1)
+                            rmask_k = response_mask[k: k + 1]
+                            new_lp_k = new_lp_k * rmask_k
 
-                        accelerator.backward(pg_loss / (n_micro_valid * gas))
-                        step_pg_loss += pg_loss.detach().item()
+                            old_lp_k = old_token_lp[k: k + 1].detach()
+                            adv_k = adv[k: k + 1].detach()
 
-                        del policy_out, new_logits, new_log_probs, new_token_lp
-                        torch.cuda.empty_cache()
+                            ratio_k = torch.exp(new_lp_k - old_lp_k)
+                            token_adv_k = adv_k.unsqueeze(1) * rmask_k
+                            surr1 = ratio_k * token_adv_k
+                            clipped_ratio_k = torch.clamp(ratio_k, 1.0 - args.clip_range_low, 1.0 + args.clip_range_high)
+                            surr2 = clipped_ratio_k * token_adv_k
+                            loss_k = (-torch.min(surr1, surr2)).sum() / total_resp_tokens
+
+                            accelerator.backward(loss_k * scale)
+                            group_pg_loss += loss_k.detach().item()
+
+                            del out_k, logits_k, lp_k, new_lp_k, ratio_k, loss_k
+                            torch.cuda.empty_cache()
+
+                        step_pg_loss += group_pg_loss
 
                     step_total_valid += n_micro_valid
                     step_all_rewards.extend(micro_rewards)
@@ -734,13 +989,20 @@ class GRPOTrainer(Trainer):
             # ===== Optimizer step (once per macro-batch) =====
             if step_total_valid == 0:
                 optimizer.zero_grad()
+                self.lr_scheduler.step()
                 self.state.global_step += 1
                 continue
 
+            for name, p in model.named_parameters():
+                if p.requires_grad and ("embed" in name or "lm_head" in name or "reward" in name):
+                    if torch.isnan(p).any():
+                        accelerator.print(f"[NaN DETECTED] param={name} at step {self.state.global_step}")
+                        break
+
             grad_norm = accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             grad_norm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
-            if math.isnan(grad_norm_val) or math.isinf(grad_norm_val):
-                accelerator.print(f"[WARNING] grad_norm={grad_norm_val} at step {self.state.global_step}, skipping update")
+            if math.isnan(grad_norm_val) or math.isinf(grad_norm_val) or grad_norm_val > 100.0:
+                accelerator.print(f"[WARNING] grad_norm={grad_norm_val:.4f} at step {self.state.global_step}, skipping update")
                 optimizer.zero_grad()
             else:
                 optimizer.step()
@@ -779,12 +1041,29 @@ class GRPOTrainer(Trainer):
                         f"A: {step_sample_resp[:]}\n"
                     )
 
+            _MAX_RUNNING_HISTORY = 500
+            if len(accumulate_rewards) > _MAX_RUNNING_HISTORY * 2:
+                accumulate_rewards = accumulate_rewards[-_MAX_RUNNING_HISTORY:]
+                accumulate_answer_acc = accumulate_answer_acc[-_MAX_RUNNING_HISTORY:]
+
             if args.save_steps and self.state.global_step % args.save_steps == 0:
                 self._accumulate_rewards = accumulate_rewards
                 self._accumulate_answer_acc = accumulate_answer_acc
                 self._skipped_groups = skipped_groups
-                self.save_model(os.path.join(args.output_dir, f"checkpoint-{self.state.global_step}"))
+                ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{self.state.global_step}")
+                self.save_model(ckpt_dir)
                 accelerator.print(f"  Saved checkpoint at step {self.state.global_step}")
+
+                if accelerator.is_main_process and getattr(args, "save_total_limit", 0) > 0:
+                    import glob, shutil
+                    ckpt_dirs = sorted(
+                        glob.glob(os.path.join(args.output_dir, "checkpoint-*")),
+                        key=lambda d: int(d.rsplit("-", 1)[-1]),
+                    )
+                    while len(ckpt_dirs) > args.save_total_limit:
+                        old = ckpt_dirs.pop(0)
+                        shutil.rmtree(old, ignore_errors=True)
+                        accelerator.print(f"  Removed old checkpoint: {old}")
 
             del step_all_rewards, step_all_answer_accs
             torch.cuda.empty_cache()
