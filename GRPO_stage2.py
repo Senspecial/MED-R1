@@ -9,84 +9,8 @@ DAPO (Decoupled Alignment Policy Optimization) improves on GRPO with:
   - Token-level clipped surrogate loss instead of sequence-level
 
 Prerequisites:
-  1. SFT model from SFT_stage1.py   → ckpts/sft_stage1/checkpoint-1-3168
-  2. PRM  model from train_prm.py   → ckpts/prm_qwen3_4b/final/
-
-Usage:
-    # Step 1: copy models to local disk for faster I/O
-    cp -r /apdcephfs_cq11/share_303693288/hunyuan/jiansensong/MED-R1/ckpts/sft_stage1/checkpoint-1-3168/tfmr /tmp/sft_model
-    cp -r ckpts/prm_qwen3_4b/final /tmp/prm_qwen3_4b
-
-    # Step 2: launch training
-    accelerate launch \
-        --config_file configs/deepspeed_zero2.yaml \
-        --num_processes 8 \
-        --num_machines 1 \
-        --machine_rank 0 \
-        --deepspeed_multinode_launcher standard \
-        GRPO_stage2.py \
-        --model_name_or_path /tmp/sft_model \
-        --prm_model_path /tmp/prm_qwen3_4b \
-        --dataset_path data/medical_o1_verifiable_problem.json \
-        --output_dir ./ckpts/dapo \
-        --group_size 8 \
-        --temperature 0.7 \
-        --clip_range_low 0.2 \
-        --clip_range_high 0.28 \
-        --dynamic_sampling True \
-        --learning_rate 5e-7 \
-        --total_episodes 20000 \
-        --per_device_batch_size 1 \
-        --gradient_accumulation_steps 16 \
-        --save_steps 50 \
-        --prm_agg min
-
-    # With QLoRA (much less memory — single GPU possible):
-    accelerate launch \
-        --config_file configs/deepspeed_zero2.yaml \
-        --num_processes 8 \
-        GRPO_stage2.py \
-        --model_name_or_path /tmp/sft_model \
-        --prm_model_path /tmp/prm_qwen3_4b \
-        --use_qlora True \
-        --lora_r 64 \
-        --lora_alpha 16 \
-        --output_dir ./ckpts/dapo_qlora \
-        --group_size 8 \
-        --per_device_batch_size 1
-
-    # ---- With vLLM generation acceleration (2-machine 16-GPU example) ----
-    #
-    # Terminal 1 — start vLLM server on GPU 7 of machine 0:
-    #   bash run/start_vllm_server.sh /tmp/sft_model 7 8000
-    #
-    # Terminal 2 — launch training on GPU 0-6 of machine 0 + all 8 GPUs of machine 1:
-    #   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 accelerate launch \
-    #       --config_file configs/deepspeed_zero2.yaml \
-    #       --num_processes 15 \
-    #       --num_machines 2 \
-    #       --machine_rank 0 \
-    #       --main_process_ip <MACHINE_0_IP> \
-    #       --main_process_port 29500 \
-    #       --deepspeed_multinode_launcher standard \
-    #       GRPO_stage2.py \
-    #       --model_name_or_path /tmp/sft_model \
-    #       --prm_model_path /tmp/prm_qwen3_4b \
-    #       --dataset_path data/medical_o1_verifiable_problem.json \
-    #       --output_dir ./ckpts/dapo \
-    #       --use_vllm True \
-    #       --vllm_base_url http://localhost:8000 \
-    #       --group_size 8 \
-    #       --temperature 0.7 \
-    #       --learning_rate 5e-7 \
-    #       --total_episodes 20000 \
-    #       --per_device_batch_size 1 \
-    #       --gradient_accumulation_steps 16 \
-    #       --save_steps 50
-    #
-    # Note: vLLM handles generation much faster via PagedAttention + continuous
-    # batching.  To refresh generation weights mid-training, restart the vLLM
-    # server pointing to the latest checkpoint directory.
+  1. SFT model from SFT_stage1.py  
+  2. PRM  model from train_prm.py   
 """
 
 import os
@@ -195,22 +119,33 @@ def load_prm(prm_path, device="cuda:0"):
 # Pad token setup — works for Qwen3, Llama, and other models
 # ---------------------------------------------------------------------------
 def setup_pad_token(tokenizer):
-    """Ensure pad_token_id is set and differs from eos_token_id."""
-    if tokenizer.pad_token_id is not None and tokenizer.pad_token_id != tokenizer.eos_token_id:
+    """Ensure pad_token_id is set and does NOT collide with any eos_token_id."""
+    eos_id = tokenizer.eos_token_id
+    eos_ids = set()
+    if isinstance(eos_id, int):
+        eos_ids.add(eos_id)
+    elif isinstance(eos_id, (list, tuple)):
+        eos_ids.update(eos_id)
+    gen_cfg = getattr(tokenizer, "generation_config", None)
+    if gen_cfg is not None:
+        gc_eos = getattr(gen_cfg, "eos_token_id", None)
+        if isinstance(gc_eos, int):
+            eos_ids.add(gc_eos)
+        elif isinstance(gc_eos, (list, tuple)):
+            eos_ids.update(gc_eos)
+
+    if tokenizer.pad_token_id is not None and tokenizer.pad_token_id not in eos_ids:
         return
 
-    # Model-specific candidates that are NOT the eos token
-    candidates = ["<|endoftext|>", "<|end_of_text|>"]
     vocab = tokenizer.get_vocab()
-    for candidate in candidates:
+    for candidate in ["<|extra_0|>", "<|endoftext|>", "<|end_of_text|>"]:
         if candidate in vocab:
             cid = tokenizer.convert_tokens_to_ids(candidate)
-            if cid != tokenizer.eos_token_id:
+            if cid not in eos_ids:
                 tokenizer.pad_token = candidate
                 tokenizer.pad_token_id = cid
                 return
 
-    # Fallback: add a dedicated pad token
     tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 
 
