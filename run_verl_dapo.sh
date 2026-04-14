@@ -161,7 +161,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 VLLM_USE_V1=0 nohup python -m verl.trainer.ma
     actor_rollout_ref.model.path="$MODEL_PATH" \
     actor_rollout_ref.actor.optim.lr=1e-5 \
     actor_rollout_ref.actor.optim.weight_decay=0.01 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=56 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=28 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.actor.use_kl_loss=false \
     actor_rollout_ref.actor.kl_loss_coef=0.0 \
