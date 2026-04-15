@@ -113,7 +113,7 @@ CUDA_VISIBLE_DEVICES=7 nohup python -u "${SCRIPT_DIR}/verl_reward/reward_server.
     --prm_path "$PRM_MODEL_PATH" \
     --judge_path "$JUDGE_MODEL_PATH" \
     --port "$REWARD_PORT" \
-    > "$LOG_DIR/reward_server.log" 2>&1 &
+    >> "$LOG_DIR/reward_server.log" 2>&1 &
 REWARD_PID=$!
 echo "  Reward server PID: $REWARD_PID"
 
@@ -168,7 +168,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 VLLM_USE_V1=0 nohup python -m verl.trainer.ma
     actor_rollout_ref.actor.clip_ratio=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
-    actor_rollout_ref.actor.ppo_epochs=2 \
+    actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.use_torch_compile=false \
     \
     actor_rollout_ref.rollout.name=vllm \
@@ -192,13 +192,13 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6 VLLM_USE_V1=0 nohup python -m verl.trainer.ma
     trainer.max_actor_ckpt_to_keep=2 \
     trainer.project_name=med_r1_dapo \
     trainer.experiment_name=dapo_prm \
-    'trainer.logger=[console]' \
+    'trainer.logger=[console,tensorboard]' \
     trainer.default_local_dir="$OUTPUT_DIR" \
     trainer.n_gpus_per_node=7 \
     trainer.nnodes=1 \
     trainer.val_before_train=false \
     ${RESUME_ARGS} \
-    > "$LOG_DIR/verl_dapo.log" 2>&1 &
+    >> "$LOG_DIR/verl_dapo.log" 2>&1 &
 
 VERL_PID=$!
 
