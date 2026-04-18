@@ -8,7 +8,7 @@ Metrics:
   4. Correlation       — do higher PRM scores predict correct answers?
 
 Usage:
-    # 8-GPU parallel — evaluate GRPO model
+    # 8-GPU parallel — evaluate GRPO model (HuggingFace format)
     python3 evaluation/eval_reasoning.py \
         --model_name /path/to/grpo_model \
         --prm_path /path/to/prm_model \
@@ -16,19 +16,19 @@ Usage:
         --num_gpus 8 \
         --max_new_tokens 1200
 
-    # Compare with SFT baseline
+    # Directly evaluate FSDP checkpoint (auto-merge in memory, no disk save)
     python3 evaluation/eval_reasoning.py \
-        --model_name /path/to/sft_model \
+        --model_name ./ckpts/dapo/global_step_150/actor \
         --prm_path /path/to/prm_model \
         --eval_file evaluation/data/eval_data.json \
         --num_gpus 8
 
     # Single GPU (quick test)
     python3 evaluation/eval_reasoning.py \
-        --model_name /path/to/grpo_model \
+        --model_name ./ckpts/dapo/global_step_150/actor \
         --prm_path /path/to/prm_model \
         --eval_file evaluation/data/eval_data.json \
-        --limit 100 --gpu_id 0
+        --limit 100
 """
 
 import argparse
@@ -37,10 +37,122 @@ import os
 import subprocess
 import sys
 import torch
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from jinja2 import Template
 from scorer import match_choice, get_results
+
+
+def load_fsdp_model_to_hf(actor_dir, device):
+    """
+    Load FSDP sharded checkpoint directly into a HuggingFace model in memory.
+    No files are saved to disk.
+
+    Args:
+        actor_dir: Path to the actor directory containing FSDP shards
+                   (e.g., ./ckpts/dapo/global_step_150/actor)
+        device: Target torch device
+
+    Returns:
+        model: HuggingFace model with merged weights
+        tokenizer: Corresponding tokenizer
+    """
+    from torch.distributed._tensor import Shard as DTShard
+
+    actor_dir = Path(actor_dir)
+    hf_dir = actor_dir / "huggingface"
+
+    # 1. Load config and tokenizer from huggingface subdir
+    print(f"  Loading config & tokenizer from {hf_dir}")
+    config = AutoConfig.from_pretrained(hf_dir, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(hf_dir, trust_remote_code=True, padding_side='left')
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # 2. Read FSDP config
+    fsdp_cfg_path = actor_dir / "fsdp_config.json"
+    with open(fsdp_cfg_path) as f:
+        fsdp_cfg = json.load(f)
+    world_size = fsdp_cfg["world_size"]
+    print(f"  FSDP world_size={world_size}, loading {world_size} shards...")
+
+    # 3. Load all shards in parallel
+    shard_list = [None] * world_size
+
+    def _load_shard(rank):
+        p = actor_dir / f"model_world_size_{world_size}_rank_{rank}.pt"
+        sd = torch.load(p, map_location="cpu", weights_only=False)
+        shard_list[rank] = sd
+
+    with ThreadPoolExecutor(max_workers=min(world_size, os.cpu_count() or 4)) as pool:
+        futs = [pool.submit(_load_shard, r) for r in range(world_size)]
+        for fut in tqdm(futs, desc="Loading FSDP shards", total=world_size):
+            fut.result()
+
+    # 4. Detect mesh info from rank-0 shard
+    from torch.distributed._tensor import DTensor
+    pivot_key = sorted(shard_list[0].keys())[0]
+    sample = shard_list[0][pivot_key]
+    if isinstance(sample, DTensor):
+        mesh = sample.device_mesh.mesh
+        mesh_dim_names = sample.device_mesh.mesh_dim_names
+    else:
+        mesh = np.array([world_size], dtype=np.int64)
+        mesh_dim_names = ("fsdp",)
+    total_shards = int(np.prod(mesh))
+
+    # 5. Merge state dict
+    print(f"  Merging {total_shards} shards (mesh={mesh}, dims={mesh_dim_names})...")
+    merged = {}
+    param_placements = {}
+
+    for key in set(shard_list[0].keys()):
+        merged[key] = []
+        for sd in shard_list:
+            tensor = sd.pop(key)
+            if isinstance(tensor, DTensor):
+                merged[key].append(tensor._local_tensor.bfloat16())
+                placements = tuple(tensor.placements)
+                if mesh_dim_names[0] in ("dp", "ddp"):
+                    placements = placements[1:]
+                if key not in param_placements:
+                    param_placements[key] = placements
+            else:
+                merged[key].append(tensor.bfloat16())
+
+    del shard_list
+
+    for key in sorted(merged):
+        if not isinstance(merged[key], list):
+            continue
+        if key in param_placements:
+            placements = param_placements[key]
+            assert len(placements) == 1, "FSDP+TP not supported"
+            p = placements[0]
+            if isinstance(p, DTShard):
+                merged[key] = torch.cat(merged[key], dim=p.dim)
+            else:
+                # Replicated
+                merged[key] = merged[key][0]
+        else:
+            merged[key] = torch.cat(merged[key], dim=0)
+
+    # 6. Build empty model and load state dict
+    print(f"  Loading merged weights into model...")
+    from accelerate import init_empty_weights
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.bfloat16)
+    model.to_empty(device="cpu")
+    model.load_state_dict(merged, strict=True)
+    del merged
+
+    model = model.to(device)
+    model.eval()
+    print(f"  Model loaded successfully!")
+    return model, tokenizer
 
 
 def postprocess_output(pred):
@@ -51,7 +163,13 @@ def postprocess_output(pred):
 
 
 class PRMScorer:
-    """Load PRM and score reasoning steps with single forward pass."""
+    """Load PRM and score reasoning steps with single forward pass.
+
+    Matches the training-time scoring logic (reward_server.py / grpo_trainer.py):
+      - Input format:  "Question: {q}\\n\\nReasoning:\\n\\n{step1}\\n\\n{step2}..."
+      - Boundary detection via offset_mapping (char→token)
+      - Aggregation: min / mean / last / weighted_mean  (default: min)
+    """
     def __init__(self, prm_path, device):
         self.device = device
         self.tokenizer = AutoTokenizer.from_pretrained(prm_path, trust_remote_code=True)
@@ -74,59 +192,107 @@ class PRMScorer:
             self.reward_head.eval()
         else:
             print(f"Warning: reward_head.pt not found at {prm_path}, using random head")
+        # 确保 reward_head 和 base_model 使用相同的 dtype
+        self.reward_head = self.reward_head.to(torch.bfloat16)
 
         self.step_sep = '\n\n'
-        self.step_sep_ids = self.tokenizer.encode(self.step_sep, add_special_tokens=False)
 
-    def _find_step_boundary_indices(self, input_ids):
-        """Find token indices where each step ends (matching \\n\\n boundaries)."""
-        ids = input_ids.tolist()
-        sep = self.step_sep_ids
-        sep_len = len(sep)
-        boundaries = []
-        for i in range(len(ids) - sep_len + 1):
-            if ids[i:i+sep_len] == sep:
-                boundaries.append(i + sep_len - 1)
-        if not boundaries or boundaries[-1] != len(ids) - 1:
-            boundaries.append(len(ids) - 1)
-        return boundaries
+    @staticmethod
+    def _aggregate(scores, agg="min"):
+        """Aggregate step scores — same logic as reward_server._aggregate."""
+        if not scores:
+            return 0.0
+        if agg == "min":
+            return min(scores)
+        if agg == "mean":
+            return sum(scores) / len(scores)
+        if agg == "last":
+            return scores[-1]
+        if agg == "weighted_mean":
+            weights = list(range(1, len(scores) + 1))
+            return sum(s * w for s, w in zip(scores, weights)) / sum(weights)
+        return min(scores)  # fallback
 
     @torch.no_grad()
-    def score_steps(self, question, reasoning_text):
+    def score_steps(self, question, reasoning_text, agg="min"):
+        """Score each reasoning step and return (step_scores, aggregated_score).
+
+        Uses the same input format and offset_mapping boundary detection as
+        reward_server.py ``_score_single`` to ensure train/eval consistency.
+        """
         steps = [s.strip() for s in reasoning_text.split(self.step_sep) if s.strip()]
         if not steps:
             return [], 0.0
 
-        full_text = question + self.step_sep + (self.step_sep).join(steps)
-        inputs = self.tokenizer(
-            full_text, return_tensors="pt",
-            truncation=True, max_length=4096
-        ).to(self.device)
+        # ── Build input text with the same prefix as training ──
+        prefix = f"Question: {question}\n\nReasoning:\n\n"
+        full_text = prefix + "\n\n".join(steps)
 
-        outputs = self.base_model(**inputs, output_hidden_states=True)
-        hidden_states = outputs.hidden_states[-1].squeeze(0)
+        encoding = self.tokenizer(
+            full_text, add_special_tokens=True,
+            return_offsets_mapping=True,
+            truncation=True, max_length=4096,
+        )
+        full_tokens = encoding["input_ids"]
+        offsets = encoding.get("offset_mapping")
 
-        boundaries = self._find_step_boundary_indices(inputs.input_ids.squeeze(0))
+        # ── Locate step-end token positions via offset_mapping ──
+        if offsets is not None:
+            step_end_chars = []
+            char_pos = len(prefix)
+            for i, step in enumerate(steps):
+                char_pos += len(step)
+                step_end_chars.append(char_pos - 1)
+                if i < len(steps) - 1:
+                    char_pos += 2  # len("\n\n")
 
-        question_ids = self.tokenizer.encode(question, add_special_tokens=False)
-        q_len = len(question_ids)
-        step_boundaries = [b for b in boundaries if b >= q_len]
+            step_end_positions = []
+            for target in step_end_chars:
+                pos = len(full_tokens) - 1  # fallback to last token
+                for tok_idx in range(len(offsets)):
+                    start, end = offsets[tok_idx]
+                    if start <= target < end:
+                        pos = tok_idx
+                        break
+                step_end_positions.append(pos)
+        else:
+            # Fallback: re-tokenize partial sequences
+            step_end_positions = []
+            for i in range(len(steps)):
+                partial = prefix + "\n\n".join(steps[:i + 1])
+                partial_tokens = self.tokenizer.encode(partial, add_special_tokens=True)
+                step_end_positions.append(len(partial_tokens) - 1)
 
-        if not step_boundaries:
-            step_boundaries = boundaries[-len(steps):] if len(boundaries) >= len(steps) else boundaries
+        # ── Forward pass ──
+        input_ids = torch.LongTensor([full_tokens]).to(self.device)
+        attention_mask = torch.ones_like(input_ids)
 
-        step_boundaries = step_boundaries[:len(steps)]
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+        hidden_states = outputs.hidden_states[-1]  # (1, seq_len, hidden)
+        seq_len = hidden_states.size(1)
 
-        boundary_hidden = hidden_states[step_boundaries]
-        scores = torch.sigmoid(self.reward_head(boundary_hidden)).squeeze(-1)
-        step_scores = scores.cpu().tolist()
+        # ── Extract hidden states at step boundaries and score ──
+        step_scores = []
+        for pos in step_end_positions:
+            pos = min(pos, seq_len - 1)
+            h = hidden_states[0, pos]
+            s = torch.sigmoid(self.reward_head(h)).item()
+            step_scores.append(s)
 
-        avg_score = sum(step_scores) / len(step_scores) if step_scores else 0.0
-        return step_scores, avg_score
+        aggregated = self._aggregate(step_scores, agg)
+        return step_scores, aggregated
 
 
 def extract_reasoning_and_answer(text):
-    """Split model output into reasoning part and final answer part."""
+    """Split model output into reasoning part and final answer part.
+
+    Handles mixed formats where models may output both
+    <think>...</think> AND ## Thinking / ## Final Response tags.
+    """
     if '## Final Response' in text:
         parts = text.split('## Final Response')
         reasoning = parts[0].replace('## Thinking', '').strip()
@@ -138,7 +304,26 @@ def extract_reasoning_and_answer(text):
     else:
         reasoning = text
         answer = text
+
+    # Clean up residual <think>/<\/think> tags (models may output both
+    # <think>...</think> and ## Thinking / ## Final Response simultaneously)
+    reasoning = reasoning.replace('<think>', '').replace('</think>', '').strip()
+
     return reasoning, answer
+
+
+def _is_fsdp_checkpoint(path):
+    """Check if the path points to an FSDP sharded checkpoint (actor directory)."""
+    p = Path(path)
+    fsdp_cfg = p / "fsdp_config.json"
+    hf_dir = p / "huggingface"
+    has_shards = any(p.glob("model_world_size_*_rank_*.pt"))
+    # It's FSDP if: has fsdp_config.json + shard files, and huggingface/ lacks weight files
+    if fsdp_cfg.exists() and has_shards:
+        hf_weights = list(hf_dir.glob("*.safetensors")) + list(hf_dir.glob("pytorch_model*.bin"))
+        if not hf_weights:
+            return True
+    return False
 
 
 def run_shard(args):
@@ -146,16 +331,21 @@ def run_shard(args):
     device = torch.device(f"cuda:0")
 
     print(f"[GPU {args.gpu_id}] Loading generation model: {args.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True, padding_side='left')
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    template = Template(tokenizer.chat_template) if tokenizer.chat_template else None
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name, trust_remote_code=True,
-        torch_dtype=torch.bfloat16
-    ).to(device)
-    model.eval()
+    if _is_fsdp_checkpoint(args.model_name):
+        print(f"[GPU {args.gpu_id}] Detected FSDP checkpoint, merging shards in memory (no disk save)...")
+        model, tokenizer = load_fsdp_model_to_hf(args.model_name, device)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True, padding_side='left')
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name, trust_remote_code=True,
+            torch_dtype=torch.bfloat16
+        ).to(device)
+        model.eval()
+
+    template = Template(tokenizer.chat_template) if tokenizer.chat_template else None
 
     print(f"[GPU {args.gpu_id}] Loading PRM: {args.prm_path}")
     prm = PRMScorer(args.prm_path, device)
@@ -198,7 +388,8 @@ def run_shard(args):
             prompts = [template.render(
                 messages=[{"role": "user", "content": p}],
                 bos_token=tokenizer.bos_token,
-                add_generation_prompt=True
+                add_generation_prompt=True,
+                enable_thinking=False,
             ) for p in prompts]
 
         if args.max_tokens > 0:
@@ -230,7 +421,7 @@ def run_shard(args):
             reasoning, answer_text = extract_reasoning_and_answer(full_output)
             ans, ans_type = match_choice(full_output, item['options'])
             is_correct = ans[0].lower() == item['answer_idx'].lower()
-            step_scores, avg_prm = prm.score_steps(item['input_str'], reasoning)
+            step_scores, avg_prm = prm.score_steps(item['input_str'], reasoning, agg=args.prm_agg)
 
             results.append({
                 'question': item['question'],
@@ -313,7 +504,9 @@ def aggregate_and_report(num_gpus, model_name, eval_file, task='api', strict_pro
 
     task_name = os.path.split(model_name)[-1]
     task_name = task_name + os.path.basename(eval_file).replace('.json', '') + f'_{task}' + ('_strict-prompt' if strict_prompt else '')
-    save_path = f'{task_name}_reasoning.json'
+    # 结果保存到 evaluation/ 目录下
+    eval_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)))
+    save_path = os.path.join(eval_dir, f'{task_name}_reasoning.json')
 
     with open(save_path, 'w') as fw:
         json.dump({
@@ -339,7 +532,7 @@ def aggregate_and_report(num_gpus, model_name, eval_file, task='api', strict_pro
 
     compatible_results = [r for r in all_results if 'output' in r]
     if compatible_results:
-        compat_path = f'{task_name}.json'
+        compat_path = os.path.join(eval_dir, f'{task_name}.json')
         with open(compat_path, 'w') as fw:
             json.dump(compatible_results, fw, ensure_ascii=False, indent=2)
         print(f"\nscorer-compatible results saved to {compat_path}")
@@ -360,6 +553,9 @@ def main():
     parser.add_argument('--gpu_id', type=int, default=-1, help="Internal: set automatically for shards")
     parser.add_argument('--limit', type=int, default=-1, help="Limit number of samples (-1 for all)")
     parser.add_argument('--strict_prompt', action="store_true")
+    parser.add_argument('--prm_agg', type=str, default='mean',
+                        choices=['min', 'mean', 'last', 'weighted_mean'],
+                        help="PRM score aggregation strategy (default: min, same as training)")
     parser.add_argument('--task', type=str, default='api')
     args = parser.parse_args()
 
@@ -381,6 +577,7 @@ def main():
                 '--num_gpus', str(args.num_gpus),
                 '--gpu_id', str(gid),
                 '--limit', str(args.limit),
+                '--prm_agg', args.prm_agg,
                 '--task', args.task,
             ]
             if args.strict_prompt:
